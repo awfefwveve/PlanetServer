@@ -17,12 +17,13 @@ public sealed class Session
     public int LoginAttempts;
 }
 
-public sealed class World(IStore store, Func<double>? clock = null)
+public sealed class World(IStore store, Func<double>? clock = null, int channelCapacity=32)
 {
     // A bounded account stripe protects duplicate login across sessions. Channel ownership
     // serializes shared gameplay only within a channel; unrelated channels can progress.
     private readonly SemaphoreSlim[] accountGates=Enumerable.Range(0,256).Select(_=>new SemaphoreSlim(1,1)).ToArray();
     private readonly SemaphoreSlim[] channelGates=Enumerable.Range(0,31).Select(_=>new SemaphoreSlim(1,1)).ToArray();
+    private readonly ChannelDirectory admission=new(channelCapacity);
     private readonly SemaphoreSlim catalogGate=new(1,1);
     private SemaphoreSlim AccountGate(string name)=>accountGates[(uint)StringComparer.Ordinal.GetHashCode(name)%256];
     private readonly ConcurrentDictionary<string, Account> accounts = new();
@@ -39,7 +40,9 @@ public sealed class World(IStore store, Func<double>? clock = null)
     {
         var accountGate=AccountGate(session.Name??command.Name.ToLowerInvariant());
         await accountGate.WaitAsync();
-        int first=session.Channel,second=(command.Kind=="switch_channel"||command.Kind=="enter_world")&&command.ChannelId>=1&&command.ChannelId<=30?command.ChannelId:first;
+        using var reservation=PrepareAdmission(session,command);
+        int requested=reservation?.Channel??command.ChannelId;
+        int first=session.Channel,second=(command.Kind=="switch_channel"||command.Kind=="enter_world")&&requested>=1&&requested<=30?requested:first;
         if(first>second)(first,second)=(second,first);
         await channelGates[first].WaitAsync();
         if(second!=first)await channelGates[second].WaitAsync();
@@ -51,7 +54,7 @@ public sealed class World(IStore store, Func<double>? clock = null)
             if(session.Name is null)return Snapshot(session,command.Sequence,"unauthorized");
             string name=session.Name,code="ok",message="";
             if(command.Kind is "characters" or "check_name" or "create_character" or "enter_world" or "leave_world") {
-                try {await catalogGate.WaitAsync();try {code=await Lobby(session,command);}finally {catalogGate.Release();}}
+                try {await catalogGate.WaitAsync();try {code=await Lobby(session,command,reservation);}finally {catalogGate.Release();}}
                 catch(Npgsql.PostgresException e) when(e.SqlState=="23505"){code="name_taken";}
                 catch(Exception e) when(e is IOException or InvalidOperationException or Npgsql.NpgsqlException) {
                     GameHost.Log("character_save_failed",name,e.GetType().Name);code="save_failed";
@@ -80,7 +83,8 @@ public sealed class World(IStore store, Func<double>? clock = null)
                 case "switch_channel":
                     if(command.ChannelId<1||command.ChannelId>Regions.ChannelCount){code="invalid_channel";break;}
                     if(time-session.LastTransfer<1){code="transfer_cooldown";break;}
-                    session.Channel=command.ChannelId;channels[name]=session.Channel;session.LastTransfer=time;
+                    if(reservation is null){code="channel_full";break;}
+                    session.Channel=reservation.Channel;channels[name]=session.Channel;reservation.Commit();session.LastTransfer=time;
                     break;
                 case "attack":
                     if(time-session.LastAttack<.4){code="cooldown";break;}
@@ -103,7 +107,17 @@ public sealed class World(IStore store, Func<double>? clock = null)
             return Snapshot(session,command.Sequence,code,message);
         } finally {if(second!=first)channelGates[second].Release();channelGates[first].Release();accountGate.Release();}
     }
-    private async Task<string> Lobby(Session session,Command command)
+    private ChannelDirectory.Reservation? PrepareAdmission(Session session,Command command)
+    {
+        if(session.Name is null || command.Sequence<=session.Sequence)return null;
+        if(command.Kind=="switch_channel" && players.ContainsKey(session.Name) && command.ChannelId>=1 && command.ChannelId<=Regions.ChannelCount)
+            return admission.Reserve(session.Name,command.ChannelId);
+        if(command.Kind=="enter_world" && session.LobbyLogin && !players.ContainsKey(session.Name) && command.RealmId=="meadow" &&
+            accounts[session.Name].Characters?.Any(c=>c.Id==command.CharacterId)==true)
+            return admission.Reserve(session.Name,command.ChannelId);
+        return null;
+    }
+    private async Task<string> Lobby(Session session,Command command,ChannelDirectory.Reservation? reservation)
     {
         if(!session.LobbyLogin)return "lobby_required";
         var name=session.Name!;var account=accounts[name];
@@ -121,13 +135,14 @@ public sealed class World(IStore store, Func<double>? clock = null)
                 var character=account.Characters?.FirstOrDefault(c=>c.Id==command.CharacterId);
                 if(character is null)return "character_not_owned";
                 if(command.ChannelId<0||command.ChannelId>Regions.ChannelCount)return "invalid_channel";
-                session.Channel=command.ChannelId==0?1:command.ChannelId;channels[name]=session.Channel;
+                if(reservation is null)return command.ChannelId==0?"world_full":"channel_full";
+                session.Channel=reservation.Channel;channels[name]=session.Channel;
                 if(Regions.Find(character.RegionId)==null)character=character with {RegionId="meadow",X=0,Z=0};
                 if(Regions.BlockReason(character.RegionId,character.X,character.Z)!="ok")character=character with {X=0,Z=0};
-                players[name]=character;session.LastMove=session.LastAttack=double.NegativeInfinity;
+                players[name]=character;reservation.Commit();session.LastMove=session.LastAttack=double.NegativeInfinity;
                 return "ok";
             case "leave_world":
-                if(players.TryGetValue(name,out var active)){await SaveProgress(name,active);players.TryRemove(name,out _);}
+                if(players.TryGetValue(name,out var active)){await SaveProgress(name,active);players.TryRemove(name,out _);channels.TryRemove(name,out _);admission.Remove(name);}
                 return "ok";
             default:return "unknown_command";
         }
@@ -143,8 +158,10 @@ public sealed class World(IStore store, Func<double>? clock = null)
         else if(!account.Verify(command.Password))return Snapshot(session,command.Sequence,"invalid_login");
         if(accounts.ContainsKey(name))return Snapshot(session,command.Sequence,"duplicate_login");
         if(command.LobbyLogin){await catalogGate.WaitAsync();try {account=await catalog.Migrate(account);}finally {catalogGate.Release();}}
+        using var legacyReservation=command.LobbyLogin?null:admission.Reserve(name,1);
+        if(!command.LobbyLogin&&legacyReservation is null)return Snapshot(session,command.Sequence,"channel_full");
         accounts[name]=account;channels[name]=1;session.Name=name;session.LobbyLogin=command.LobbyLogin;
-        if(!command.LobbyLogin)players[name]=CharacterData.Legacy(account);
+        if(!command.LobbyLogin){players[name]=CharacterData.Legacy(account);legacyReservation!.Commit();}
         return Snapshot(session,command.Sequence,"ok");
     }
     private async Task SaveProgress(string name,CharacterData character)
@@ -161,13 +178,14 @@ public sealed class World(IStore store, Func<double>? clock = null)
         try {
             if(session.Name is null)return;var name=session.Name;
             try {if(players.TryGetValue(name,out var character))await SaveProgress(name,character);}
-            finally {players.TryRemove(name,out _);accounts.TryRemove(name,out _);channels.TryRemove(name,out _);session.Name=null;}
+            finally {players.TryRemove(name,out _);accounts.TryRemove(name,out _);channels.TryRemove(name,out _);admission.Remove(name);session.Name=null;}
         } finally {channelGates[channel].Release();accountGate.Release();}
     }
     private Update Snapshot(Session session,ulong sequence,string code,string message="")
     {
         var result=new Update{Sequence=sequence,Code=code,Message=message,Tick=Interlocked.Increment(ref tick)};
         if(session.Name is null)return result;
+        result.Channels.AddRange(admission.Snapshot());
         var account=accounts[session.Name];
         if(session.LobbyLogin)result.Characters.AddRange((account.Characters??[]).Select(c=>c.ToProtocol()));
         if(!players.TryGetValue(session.Name,out var selected))return result;

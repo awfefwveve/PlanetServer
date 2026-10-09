@@ -13,7 +13,9 @@ if (string.IsNullOrWhiteSpace(connection)) store = new FileStore(Path.Combine(di
 else { var postgres = new PostgresStore(connection); await postgres.Initialize(); store = postgres; }
 var capacityText=Environment.GetEnvironmentVariable("PLANET_MAX_CONNECTIONS");
 var capacity=string.IsNullOrEmpty(capacityText)?128:int.Parse(capacityText);
-var host = new GameHost(new World(store), certificate, 7777, capacity);
+var channelCapacityText=Environment.GetEnvironmentVariable("PLANET_CHANNEL_CAPACITY");
+var channelCapacity=string.IsNullOrEmpty(channelCapacityText)?32:int.Parse(channelCapacityText);
+var host = new GameHost(new World(store,channelCapacity:channelCapacity), certificate, 7777, capacity);
 host.Start();
 GameHost.Log("listening", null, $"127.0.0.1:{host.Port}; storage={(string.IsNullOrWhiteSpace(connection) ? "local-development" : "postgresql")}");
 Console.WriteLine("Planet server running. Press Ctrl+C to save and stop.");

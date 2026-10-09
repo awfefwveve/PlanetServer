@@ -49,6 +49,12 @@ message MonsterView {
   int32 hp = 3;
   int32 max_hp = 4;
 }
+message ChannelView {
+  int32 id = 1;
+  int32 online = 2;
+  int32 reserved = 3;
+  int32 capacity = 4;
+}
 message Update {
   uint64 sequence = 1;
   string code = 2;
@@ -61,4 +67,5 @@ message Update {
   string selected_character_id = 9;
   string region_id = 10;
   int32 channel_id = 11;
+  repeated ChannelView channels = 12;
 }

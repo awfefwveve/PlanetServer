@@ -276,6 +276,44 @@ parallelTime+=2;var swapA=parallelWorld.Handle(slowSession,new Command{Sequence=
 var swapB=parallelWorld.Handle(fastSession,new Command{Sequence=4,Kind="switch_channel",ChannelId=1});
 await Task.WhenAll(swapA,swapB).WaitAsync(TimeSpan.FromSeconds(3));
 Check(swapA.Result.Code=="ok" && swapB.Result.Code=="ok","opposing channel requests finish without deadlock");
+// Admission transactions: a pending seat counts against capacity until commit/dispose.
+var directory=new ChannelDirectory(1);
+using(var seat=directory.Reserve("pending",1)!) {
+    Check(directory.Reserve("other",1)==null,"pending reservation prevents overbooking");
+    Check(directory.Snapshot()[0].Online==0&&directory.Snapshot()[0].Reserved==1,"pending and active seats reported separately");
+}
+Check(directory.Snapshot()[0].Reserved==0,"abandoned request releases reservation");
+var raceSeats=await Task.WhenAll(Enumerable.Range(0,40).Select(i=>Task.Run(()=>directory.Reserve("race"+i,1))));
+Check(raceSeats.Count(x=>x!=null)==1,"forty simultaneous reservations admit one into last slot");
+foreach(var seat in raceSeats)seat?.Dispose();
+for(int i=1;i<=Regions.ChannelCount;i++){using var seat=directory.Reserve("filled"+i,0)!;Check(seat.Channel==i,"automatic assignment selects least occupied channel "+i);seat.Commit();}
+Check(directory.Reserve("overflow",0)==null,"automatic admission refuses full world");
+directory.Remove("filled7");directory.Remove("filled7");
+using(var seat=directory.Reserve("replacement",0)!)Check(seat.Channel==7,"released seat becomes available and cleanup is idempotent");
+var admissionStore=new FaultStore(new FileStore(Path.Combine(dir,"admission")));
+for(int i=0;i<3;i++)await admissionStore.Save(Account.Create("admit"+i,"test-pass-123") with {Characters=[new CharacterData("char"+i,"입장"+i,new())]},null);
+var admissionWorld=new World(admissionStore,channelCapacity:1);var entrants=Enumerable.Range(0,3).Select(_=>new Session()).ToArray();ulong admissionSequence=0;
+Task<Update> Admit(int i,string kind,int channel=0)=>admissionWorld.Handle(entrants[i],new Command{Sequence=++admissionSequence,Kind=kind,Name="admit"+i,Password="test-pass-123",LobbyLogin=true,CharacterId="char"+i,RealmId="meadow",ChannelId=channel});
+for(int i=0;i<3;i++)await Admit(i,"login");
+Check((await Admit(0,"snapshot")).Channels.All(c=>c.Online==0),"lobby connections do not consume channel seats");
+var entrantsRace=await Task.WhenAll(Admit(0,"enter_world",1),Admit(1,"enter_world",1));
+Check(entrantsRace.Count(x=>x.Code=="ok")==1&&entrantsRace.Count(x=>x.Code=="channel_full")==1,"simultaneous world entries cannot exceed capacity");
+int winner=entrantsRace[0].Code=="ok"?0:1,loser=1-winner;
+var autoEntry=await Admit(loser,"enter_world");
+Check(autoEntry.Code=="ok"&&autoEntry.ChannelId==2,"world entry automatically selects free channel");
+var deniedSwitch=await Admit(loser,"switch_channel",1);
+Check(deniedSwitch.Code=="channel_full"&&deniedSwitch.ChannelId==2&&deniedSwitch.InWorld,"full channel transfer preserves source membership");
+Check((await Admit(loser,"snapshot")).Channels.Single(c=>c.Id==2).Online==1,"failed transfer does not release original seat");
+admissionStore.Fail=true;
+Check((await Admit(winner,"leave_world")).Code=="save_failed","failed departure save keeps player in world");
+Check((await Admit(2,"enter_world",1)).Code=="channel_full","failed departure retains occupied seat");
+admissionStore.Fail=false;await Admit(winner,"leave_world");
+Check((await Admit(2,"enter_world",1)).Code=="ok","successful departure releases seat for next player");
+admissionStore.Fail=true;
+try{await admissionWorld.Disconnect(entrants[2]);}catch(IOException){}
+admissionStore.Fail=false;
+Check((await Admit(winner,"enter_world",1)).Code=="ok","disconnect save failure still releases admission seat");
+Check((await Admit(winner,"snapshot")).Channels.All(c=>c.Reserved==0&&c.Online<=c.Capacity),"completed requests leave no leaked reservations");
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore
