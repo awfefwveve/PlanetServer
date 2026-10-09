@@ -152,6 +152,9 @@ if (!string.IsNullOrEmpty(db))
     string uniqueName="C"+Guid.NewGuid().ToString("N")[..10];
     var made=await new CharacterCatalog(postgres).Create(pgOwner,new Command{DisplayName=uniqueName,Appearance=new Appearance{Archetype="나린",HairColor=2}});
     Check(made.Code=="ok"&&(await postgres.Load(pgOwner.Name))!.Characters![0].Look.HairColor==2,"PostgreSQL character and appearance persistence");
+    var regionSaved=made.Account with {Revision=made.Account.Revision+1,Characters=[made.Account.Characters![0] with {RegionId="coast",X=-15.5f}]};
+    await postgres.Save(regionSaved,made.Account.Revision);
+    Check((await postgres.Load(pgOwner.Name))!.Characters![0].RegionId=="coast","PostgreSQL destination region persistence");
     Check(await postgres.CharacterNameExists(CharacterCatalog.NameKey(uniqueName.ToLowerInvariant())),"PostgreSQL normalized name index");
     bool duplicateName=false;
     try {await postgres.Save(pgOther with {Revision=1,Characters=[made.Account.Characters![0] with {Id=Guid.NewGuid().ToString("N")}]},0);}
@@ -164,7 +167,7 @@ else Console.WriteLine("SKIP: PostgreSQL integration (PLANET_TEST_DB not set)");
 var diagonal=MovementRules.Evaluate(0,0,(float)(1/Math.Sqrt(2)),(float)(1/Math.Sqrt(2)),.1);
 Check(diagonal.Code=="ok" && Math.Abs(Math.Sqrt(diagonal.X*diagonal.X+diagonal.Z*diagonal.Z)-.24)<.00001,"diagonal input does not increase speed");
 Check(MovementRules.Evaluate(0,0,1,1,.1).Code=="invalid","unnormalized diagonal cheat rejected");
-Check(MovementRules.Evaluate(6.96f,0,1,0,.1).Code=="boundary","walk boundary rejects crossing");
+Check(MovementRules.Evaluate(17.96f,0,1,0,.1).Code=="boundary","walk boundary rejects crossing");
 Check(MovementRules.Evaluate(-3.1f,2,1,0,.1).Code=="blocked","rock includes player collision radius");
 Check(MovementRules.Evaluate(-3.1f,2,-1,0,.1).Code=="ok","player can move away from rock");
 Check(MovementRules.Evaluate(0,0,float.PositiveInfinity,0,.1).Code=="invalid","infinite input rejected");
@@ -173,8 +176,8 @@ var moveStore=new FileStore(Path.Combine(dir,"movement"));
 var moveWorld=new World(moveStore,()=>time);var mover=new Session();
 await moveWorld.Handle(mover,new Command{Sequence=1,Kind="login",Name="walker",Password="test-pass-123"});
 Update moveState=null!;
-for(ulong i=2;i<42;i++){time+=.1;moveState=await moveWorld.Handle(mover,new Command{Sequence=i,Kind="move",Dx=1});}
-Check(moveState.Code=="boundary" && moveState.Players.Single().X<=7,"world enforces boundary under repeated requests");
+for(ulong i=2;i<100;i++){time+=.1;moveState=await moveWorld.Handle(mover,new Command{Sequence=i,Kind="move",Dx=1});}
+Check(moveState.Code=="boundary" && moveState.Players.Single().X<=18,"world enforces boundary under repeated requests");
 float lastX=moveState.Players.Single().X;
 await moveWorld.Disconnect(mover);
 var reloaded=await new World(moveStore,()=>time).Handle(new Session(),new Command{Sequence=1,Kind="login",Name="walker",Password="test-pass-123"});
@@ -226,6 +229,32 @@ var imported=await lobbyWorld.Handle(new Session(),new Command{Sequence=1,Kind="
 Check(imported.Characters.Count==1,"old account progress migrated into character roster");
 var oldStored=await lobbyStore.Load("oldaccount");
 Check(oldStored!.Characters![0].Gold==200&&oldStored.Characters[0].QuestClaimed,"legacy migration preserves rewards");
+// Region transitions are server-authoritative and scoped by channel.
+var regionStore=new FaultStore(new FileStore(Path.Combine(dir,"regions")));
+await regionStore.Save(Account.Create("portaluser","test-pass-123") with {X=16.5f},null);
+var regionWorld=new World(regionStore,()=>time);var traveler=new Session();var neighbor=new Session();ulong rs=0;
+async Task<Update> RegionSend(Session session,string kind,string portal="",int channel=0,float dx=0)=>await regionWorld.Handle(session,new Command{Sequence=++rs,Kind=kind,Name=session==traveler?"portaluser":"neighbor",Password="test-pass-123",PortalId=portal,ChannelId=channel,Dx=dx});
+await RegionSend(traveler,"login");await RegionSend(neighbor,"login");
+Check((await RegionSend(neighbor,"portal","east")).Code=="portal_denied","remote portal activation rejected");
+regionStore.Fail=true;
+var failedTransfer=await RegionSend(traveler,"portal","east");
+Check(failedTransfer.Code=="save_failed"&&failedTransfer.RegionId=="meadow"&&failedTransfer.Players.Count==2,"failed portal save leaves player in source region");
+regionStore.Fail=false;var moved=await RegionSend(traveler,"portal","east");
+Check(moved.Code=="ok"&&moved.RegionId=="coast"&&moved.Players.Single().X==-15.5f,"server chooses linked region and arrival position");
+Check((await RegionSend(neighbor,"snapshot")).Players.Count==1,"source region no longer includes transferred player");
+Check((await RegionSend(traveler,"portal","north")).Code=="portal_denied","closed exit rejected");
+Check((await RegionSend(traveler,"portal","west")).Code=="transfer_cooldown","portal bounce cooldown enforced");
+await regionWorld.Disconnect(traveler);traveler=new Session();
+Check((await RegionSend(traveler,"login")).RegionId=="coast","region and destination survive reconnect");
+time+=2;await RegionSend(traveler,"portal","west");
+Check((await RegionSend(neighbor,"snapshot")).Players.Count==2,"linked return portal rejoins original region");
+for(int i=0;i<10;i++){time+=.1;await RegionSend(neighbor,"move",dx:1);}
+time+=1;await RegionSend(neighbor,"attack");
+Check((await RegionSend(traveler,"snapshot")).Monster.Hp==2,"same region and channel share monster state");
+time+=2;var differentChannel=await RegionSend(traveler,"switch_channel",channel:30);
+Check(differentChannel.ChannelId==30&&differentChannel.Players.Count==1&&differentChannel.Monster.Hp==3,"channel thirty isolates players and monsters");
+Check((await RegionSend(traveler,"switch_channel",channel:31)).Code=="invalid_channel","out of range channel rejected");
+Check(Regions.BlockReason("meadow",18.2f,0)=="boundary"&&Regions.BlockReason("coast",0,22.2f)=="boundary","unopened region edges cannot be walked through");
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore

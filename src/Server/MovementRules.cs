@@ -7,13 +7,13 @@ public static class MovementRules
 {
     public const double InputInterval = .08;
     public const float Step = .24f;
-    public static (string Code, float X, float Z) Evaluate(float x, float z, float dx, float dz, double elapsed)
+    public static (string Code, float X, float Z) Evaluate(float x, float z, float dx, float dz, double elapsed,string region="meadow")
     {
         if (!float.IsFinite(dx) || !float.IsFinite(dz)) return ("invalid", x, z);
         if (elapsed < InputInterval) return ("rate_limited", x, z);
         if ((double)dx*dx+(double)dz*dz > 1.0001) return ("invalid", x, z);
         float nextX=x+dx*Step, nextZ=z+dz*Step;
-        string reason=MeadowMap.BlockReason(nextX,nextZ);
+        string reason=Regions.BlockReason(region,nextX,nextZ);
         return reason=="ok" ? (reason,nextX,nextZ) : (reason,x,z);
     }
 }

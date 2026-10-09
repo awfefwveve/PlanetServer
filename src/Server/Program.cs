@@ -13,7 +13,7 @@ if (string.IsNullOrWhiteSpace(connection)) store = new FileStore(Path.Combine(di
 else { var postgres = new PostgresStore(connection); await postgres.Initialize(); store = postgres; }
 var host = new GameHost(new World(store), certificate, 7777);
 host.Start();
-GameHost.Log("listening", null, $"127.0.0.1:{host.Port}; storage={(connection is null ? "local-development" : "postgresql")}");
+GameHost.Log("listening", null, $"127.0.0.1:{host.Port}; storage={(string.IsNullOrWhiteSpace(connection) ? "local-development" : "postgresql")}");
 Console.WriteLine("Planet server running. Press Ctrl+C to save and stop.");
 var stop = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.TrySetResult(); };
