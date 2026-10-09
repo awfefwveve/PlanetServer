@@ -1,0 +1,36 @@
+syntax = "proto3";
+option csharp_namespace = "Planet.Protocol";
+package planet;
+
+// Client sends intentions; only the server changes game state.
+message Command {
+  uint64 sequence = 1;
+  string kind = 2; // login, move, attack, claim, snapshot
+  string name = 3;
+  string password = 4;
+  float dx = 5;
+  float dz = 6;
+}
+message PlayerView {
+  string name = 1;
+  float x = 2;
+  float z = 3;
+  int32 kills = 4;
+  int32 shards = 5;
+  int32 gold = 6;
+  bool quest_claimed = 7;
+}
+message MonsterView {
+  float x = 1;
+  float z = 2;
+  int32 hp = 3;
+  int32 max_hp = 4;
+}
+message Update {
+  uint64 sequence = 1;
+  string code = 2;
+  string message = 3;
+  repeated PlayerView players = 4;
+  MonsterView monster = 5;
+  int64 tick = 6;
+}

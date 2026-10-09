@@ -1,0 +1,33 @@
+PASS: unauthenticated actions rejected
+PASS: account creation and login
+PASS: wrong password rejected
+PASS: duplicate login rejected
+PASS: two players share the same world
+PASS: NaN position input rejected
+PASS: oversized movement rejected
+PASS: quest reward prerequisites enforced
+PASS: server checks attack distance
+PASS: movement spam rejected
+PASS: movement uses bounded server steps
+PASS: duplicate sequence rejected
+PASS: attack cooldown enforced
+PASS: injected storage failure surfaces
+PASS: failed save does not grant reward or kill monster
+PASS: kill reward persisted once
+PASS: concurrent quest claims grant reward once
+PASS: progress survives a new world instance
+PASS: reward cannot be reclaimed after restart
+PASS: TCP/TLS/Protobuf end-to-end login
+PASS: two TLS clients observe both characters
+PASS: fragmented header and coalesced frames parsed correctly
+PASS: wrong TLS certificate pin rejected
+{"at":"2026-10-09T06:29:41.6243474+00:00","kind":"session_closed","character":"second","detail":"EndOfStreamException"}
+{"at":"2026-10-09T06:29:41.6242297+00:00","kind":"session_closed","character":null,"detail":"IOException"}
+{"at":"2026-10-09T06:29:41.6245753+00:00","kind":"session_closed","character":"network","detail":"TaskCanceledException"}
+PASS: oversized frames rejected before allocation
+PASS: truncated frames rejected
+PASS: PostgreSQL save/load
+PASS: PostgreSQL stale revision cannot overwrite committed reward
+PASS: PostgreSQL world grants concurrent quest reward once
+PASS: PostgreSQL world restores completed quest after restart
+RESULT: 29 assertions passed. Temporary test data: C:\Users\USER\Documents\Codex\2026-10-09\new-chat\work\planet-tests-9bbe6523595a4b3388014fb842a3e58a
