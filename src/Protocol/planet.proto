@@ -10,6 +10,24 @@ message Command {
   string password = 4;
   float dx = 5;
   float dz = 6;
+  bool lobby_login = 7;
+  string character_id = 8;
+  string display_name = 9;
+  Appearance appearance = 10;
+  string realm_id = 11;
+}
+message Appearance {
+  string archetype = 1;
+  int32 gender = 2;
+  int32 skin = 3;
+  int32 face = 4;
+  int32 hair = 5;
+  int32 hair_color = 6;
+}
+message CharacterInfo {
+  string id = 1;
+  string name = 2;
+  Appearance appearance = 3;
 }
 message PlayerView {
   string name = 1;
@@ -19,6 +37,9 @@ message PlayerView {
   int32 shards = 5;
   int32 gold = 6;
   bool quest_claimed = 7;
+  string character_id = 8;
+  string display_name = 9;
+  Appearance appearance = 10;
 }
 message MonsterView {
   float x = 1;
@@ -33,4 +54,7 @@ message Update {
   repeated PlayerView players = 4;
   MonsterView monster = 5;
   int64 tick = 6;
+  repeated CharacterInfo characters = 7;
+  bool in_world = 8;
+  string selected_character_id = 9;
 }

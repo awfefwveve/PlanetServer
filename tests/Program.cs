@@ -146,6 +146,18 @@ if (!string.IsNullOrEmpty(db))
     var restored = await pgWorld.Handle(new Session(), new Command { Sequence = 1, Kind = "login", Name = name, Password = "test-pass-123" });
     Check(restored.Players.Single().Gold == 100 && restored.Players.Single().QuestClaimed,
         "PostgreSQL world restores completed quest after restart");
+    var pgOwner=Account.Create("pc_"+Guid.NewGuid().ToString("N")[..10],"test-pass-123");
+    var pgOther=Account.Create("pc_"+Guid.NewGuid().ToString("N")[..10],"test-pass-123");
+    await postgres.Save(pgOwner,null);await postgres.Save(pgOther,null);
+    string uniqueName="C"+Guid.NewGuid().ToString("N")[..10];
+    var made=await new CharacterCatalog(postgres).Create(pgOwner,new Command{DisplayName=uniqueName,Appearance=new Appearance{Archetype="나린",HairColor=2}});
+    Check(made.Code=="ok"&&(await postgres.Load(pgOwner.Name))!.Characters![0].Look.HairColor==2,"PostgreSQL character and appearance persistence");
+    Check(await postgres.CharacterNameExists(CharacterCatalog.NameKey(uniqueName.ToLowerInvariant())),"PostgreSQL normalized name index");
+    bool duplicateName=false;
+    try {await postgres.Save(pgOther with {Revision=1,Characters=[made.Account.Characters![0] with {Id=Guid.NewGuid().ToString("N")}]},0);}
+    catch(Npgsql.PostgresException e) when(e.SqlState=="23505"){duplicateName=true;}
+    var unchanged=await postgres.Load(pgOther.Name);
+    Check(duplicateName&&unchanged!.Revision==0&&unchanged.Characters!.Length==0,"PostgreSQL unique-name failure rolls back account payload and revision");
 }
 else Console.WriteLine("SKIP: PostgreSQL integration (PLANET_TEST_DB not set)");
 // Movement policy and actual world regression checks for the shared meadow map.
@@ -167,12 +179,60 @@ float lastX=moveState.Players.Single().X;
 await moveWorld.Disconnect(mover);
 var reloaded=await new World(moveStore,()=>time).Handle(new Session(),new Command{Sequence=1,Kind="login",Name="walker",Password="test-pass-123"});
 Check(Math.Abs(reloaded.Players.Single().X-lastX)<.00001,"accepted movement survives disconnect and reload");
+// Real server-owned lobby, independent characters, persistence and ownership.
+var lobbyStore=new FaultStore(new FileStore(Path.Combine(dir,"lobby")));
+var lobbyWorld=new World(lobbyStore,()=>time);
+var owner=new Session();var otherOwner=new Session();ulong lobbySeq=0;
+async Task<Update> Lobby(Session who,string kind,string display="",string id="",Appearance? look=null)
+    =>await lobbyWorld.Handle(who,new Command{Sequence=++lobbySeq,Kind=kind,Name=who==owner?"owner":"other",Password="test-pass-123",LobbyLogin=true,DisplayName=display,CharacterId=id,RealmId="meadow",Appearance=look});
+var look=new Appearance{Archetype="나린",HairColor=2,Skin=1,Hair=2,Face=1,Gender=1};
+var roster=await Lobby(owner,"login");
+Check(!roster.InWorld&&roster.Characters.Count==0,"new account enters empty lobby, not world");
+Check((await Lobby(owner,"move")).Code=="not_in_world","lobby cannot move before selecting character");
+Check((await Lobby(owner,"check_name","../x")).Code=="invalid_name","invalid character name rejected by server");
+Check((await Lobby(owner,"create_character","첫여행자",look:new Appearance{Archetype="unknown"})).Code=="invalid_appearance","forged appearance rejected");
+roster=await Lobby(owner,"create_character","첫여행자",look:look);
+var firstId=roster.Characters.Single().Id;
+Check(roster.Code=="ok"&&roster.Characters[0].Appearance.HairColor==2,"character identity and appearance saved");
+await Lobby(otherOwner,"login");
+Check((await Lobby(otherOwner,"check_name","첫여행자")).Code=="name_taken","names are unique across accounts");
+Check((await Lobby(otherOwner,"enter_world",id:firstId)).Code=="character_not_owned","cannot enter using another account character");
+var duplicateCreates=await Task.WhenAll(Lobby(owner,"create_character","동시생성",look:look),Lobby(otherOwner,"create_character","동시생성",look:look));
+Check(duplicateCreates.Count(r=>r.Code=="ok")==1&&duplicateCreates.Count(r=>r.Code=="name_taken")==1,"concurrent duplicate create grants name once");
+lobbyStore.Fail=true;
+Check((await Lobby(owner,"create_character","저장실패",look:look)).Code=="save_failed","creation storage failure returned to UI");
+lobbyStore.Fail=false;
+Check((await Lobby(owner,"characters")).Characters.All(c=>c.Name!="저장실패"),"failed creation not applied to roster");
+var entered=await Lobby(owner,"enter_world",id:firstId);
+Check(entered.InWorld&&entered.Players.Single().DisplayName=="첫여행자","owned selection enters correct character");
+time+=1;
+await lobbyWorld.Handle(owner,new Command{Sequence=++lobbySeq,Kind="move",Dx=1});
+await Lobby(owner,"leave_world");
+roster=await Lobby(owner,"characters");var secondId=roster.Characters.First(c=>c.Id!=firstId).Id;
+entered=await Lobby(owner,"enter_world",id:secondId);
+Check(entered.Players.Single().X==0,"second character has independent position");
+await lobbyWorld.Disconnect(owner);await lobbyWorld.Disconnect(otherOwner);
+lobbyWorld=new World(new FileStore(Path.Combine(dir,"lobby")),()=>time);owner=new Session();
+roster=await Lobby(owner,"login");
+Check(roster.Characters.Count==2&&roster.Characters.Any(c=>c.Id==firstId&&c.Appearance.Skin==1),"roster and appearance survive fresh server instance");
+entered=await Lobby(owner,"enter_world",id:firstId);
+Check(Math.Abs(entered.Players.Single().X-.24f)<.00001,"selected character position survives fresh server instance");
+await Lobby(owner,"leave_world");
+for(int i=0;i<10;i++)await Lobby(owner,"create_character","추가"+i,look:look);
+Check((await Lobby(owner,"create_character","초과생성",look:look)).Code=="slots_full","server enforces twelve character slots");
+var legacyAccount=Account.Create("oldaccount","test-pass-123") with {Characters=null,X=1,Gold=200,Kills=3,QuestClaimed=true};
+await lobbyStore.Save(legacyAccount,null);
+var imported=await lobbyWorld.Handle(new Session(),new Command{Sequence=1,Kind="login",Name="oldaccount",Password="test-pass-123",LobbyLogin=true});
+Check(imported.Characters.Count==1,"old account progress migrated into character roster");
+var oldStored=await lobbyStore.Load("oldaccount");
+Check(oldStored!.Characters![0].Gold==200&&oldStored.Characters[0].QuestClaimed,"legacy migration preserves rewards");
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore
 {
     public bool Fail;
     public Task<Account?> Load(string name) => inner.Load(name);
+    public Task<bool> CharacterNameExists(string name) => inner.CharacterNameExists(name);
     public Task Save(Account account, long? expectedRevision) => Fail
         ? Task.FromException(new IOException("Injected storage failure")) : inner.Save(account, expectedRevision);
 }
