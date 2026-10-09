@@ -67,6 +67,32 @@ var saved = state.Players.Single();
 Check(saved.Kills == 3 && saved.Shards == 3 && saved.Gold == 100 && saved.QuestClaimed, "progress survives a new world instance");
 Check((await Send(alice, "claim")).Code == "already_claimed", "reward cannot be reclaimed after restart");
 
+// Room chat: authoritative sender, scoped audience, bounded history and incremental delivery.
+var chatStore=new FileStore(Path.Combine(dir,"chat"));
+var chatWorld=new World(chatStore,()=>time);
+var ca=new Session();var cb=new Session();ulong cs=0;
+async Task<Update> ChatSend(Session session,string kind,string text="",long after=0,int channel=0)=>await chatWorld.Handle(session,new Command{Sequence=++cs,Kind=kind,Name=session==ca?"chatalice":"chatbob",Password="test-pass-123",ChatText=text,ChatAfter=after,ChannelId=channel});
+Check((await ChatSend(ca,"chat","hello")).Code=="unauthorized","chat requires authentication");
+await ChatSend(ca,"login");await ChatSend(cb,"login");
+Check((await ChatSend(ca,"chat","안녕하세요 <b>문자</b>")).Code=="ok","Korean chat accepted");
+var heard=await ChatSend(cb,"snapshot");
+Check(heard.Chat.Count==1&&heard.Chat[0].Sender=="chatalice"&&heard.Chat[0].Text.Contains("<b>"),"server sender and plain-text body delivered to peer");
+Check((await ChatSend(cb,"snapshot",after:heard.Chat[0].Id)).Chat.Count==0,"chat cursor excludes acknowledged messages");
+await chatStore.Save(Account.Create("forestpeer","test-pass-123") with {RegionId="forest"},null);
+var forestPeer=new Session();var forestChat=await chatWorld.Handle(forestPeer,new Command{Sequence=1,Kind="login",Name="forestpeer",Password="test-pass-123"});
+Check(forestChat.Chat.Count==0,"other regions in same channel cannot read chat");
+await chatWorld.Disconnect(forestPeer);
+var lobbyChatSession=new Session();await chatWorld.Handle(lobbyChatSession,new Command{Sequence=1,Kind="login",Name="lobbypeer",Password="test-pass-123",LobbyLogin=true});
+Check((await chatWorld.Handle(lobbyChatSession,new Command{Sequence=2,Kind="chat",ChatText="lobby message"})).Code=="not_in_world","lobby cannot send field chat");
+await chatWorld.Disconnect(lobbyChatSession);
+Check((await ChatSend(ca,"chat","spam")).Code=="chat_rate_limited","chat flood limited");
+foreach(var bad in new[]{"",new string('x',101),"fake\n[Admin]","a\u202eb"})Check((await ChatSend(ca,"chat",bad)).Code=="invalid_chat","invalid chat rejected");
+time+=2;await ChatSend(cb,"switch_channel",channel:2);
+Check((await ChatSend(cb,"snapshot")).Chat.Count==0,"other channels cannot read room chat");
+for(int i=0;i<55;i++){time+=1.01;await ChatSend(ca,"chat","line "+i);}
+Check((await ChatSend(ca,"snapshot")).Chat.Count==50,"room chat history is bounded");
+await chatWorld.Disconnect(ca);await chatWorld.Disconnect(cb);
+
 // Real loopback TCP + TLS + generated Protobuf integration.
 using var certificate = GameHost.DevelopmentCertificate(Path.Combine(dir, "tls"));
 var pin = certificate.GetCertHashString(HashAlgorithmName.SHA256);
@@ -101,6 +127,11 @@ await using (var host = new GameHost(new World(new FileStore(Path.Combine(dir, "
     var r1 = Update.Parser.ParseFrom(await Framing.ReadAsync(tls, CancellationToken.None));
     var r2 = Update.Parser.ParseFrom(await Framing.ReadAsync(tls, CancellationToken.None));
     Check(r1.Sequence == 2 && r2.Sequence == 3, "fragmented header and coalesced frames parsed correctly");
+    await Framing.WriteAsync(tls,new Command{Sequence=4,Kind="chat",ChatText="실제 TLS 채팅",DisplayName="forged"}.ToByteArray(),CancellationToken.None);
+    var sentChat=Update.Parser.ParseFrom(await Framing.ReadAsync(tls,CancellationToken.None));
+    await Framing.WriteAsync(tls2,new Command{Sequence=2,Kind="snapshot"}.ToByteArray(),CancellationToken.None);
+    var peerChat=Update.Parser.ParseFrom(await Framing.ReadAsync(tls2,CancellationToken.None));
+    Check(sentChat.Code=="ok"&&peerChat.Chat.Single().Sender=="network"&&peerChat.Chat[0].Text=="실제 TLS 채팅","chat traverses TLS protobuf between two clients without spoofing");
     using var badClient = new TcpClient(); await badClient.ConnectAsync("127.0.0.1", host.Port);
     using var badTls = new SslStream(badClient.GetStream(), false, (_, cert, _, _) => cert != null &&
         Convert.ToHexString(SHA256.HashData(cert.GetRawCertData())) == "WRONG_PIN");

@@ -15,6 +15,8 @@ public sealed class Session
     public double LastMove = double.NegativeInfinity;
     public double LastAttack = double.NegativeInfinity;
     public int LoginAttempts;
+    public double LastChat = double.NegativeInfinity;
+    public long ChatAfter;
 }
 
 public sealed class World(IStore store, Func<double>? clock = null, int channelCapacity=32)
@@ -30,11 +32,12 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
     private readonly ConcurrentDictionary<string, CharacterData> players = new();
     private readonly CharacterCatalog catalog=new(store);
     private readonly Func<double> now = clock ?? (() => (double)Stopwatch.GetTimestamp() / Stopwatch.Frequency);
-    private sealed class Room {public int Hp=3;public double RespawnAt;}
+    private sealed class Room {public int Hp=3;public double RespawnAt;public readonly RoomChat Chat=new();}
     private readonly ConcurrentDictionary<string,Room> rooms=new();
     private readonly ConcurrentDictionary<string,int> channels=new();
     private Room GetRoom(int channel,string region){string key=channel+":"+region;if(!rooms.TryGetValue(key,out var room)){room=rooms.GetOrAdd(key,_=>new Room());}if(room.Hp==0&&now()>=room.RespawnAt)room.Hp=3;return room;}
     private long tick;
+    private long chatId;
 
     public async Task<Update> Handle(Session session, Command command)
     {
@@ -50,6 +53,7 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             var time=now();
             if(command.Sequence==0||command.Sequence<=session.Sequence)return Snapshot(session,command.Sequence,"replay");
             session.Sequence=command.Sequence;
+            session.ChatAfter=Math.Max(0,command.ChatAfter);
             if(command.Kind=="login")return await Login(session,command);
             if(session.Name is null)return Snapshot(session,command.Sequence,"unauthorized");
             string name=session.Name,code="ok",message="";
@@ -65,6 +69,12 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             if(!players.TryGetValue(name,out var current))return Snapshot(session,command.Sequence,"not_in_world");
             var room=GetRoom(session.Channel,current.RegionId);
             switch(command.Kind) {
+                case "chat":
+                    if(!RoomChat.Valid(command.ChatText)){code="invalid_chat";break;}
+                    if(time-session.LastChat<1){code="chat_rate_limited";break;}
+                    session.LastChat=time;
+                    room.Chat.Add(new ChatMessage{Id=Interlocked.Increment(ref chatId),Sender=current.Name,Text=command.ChatText.Trim(),ChannelId=session.Channel,RegionId=current.RegionId});
+                    break;
                 case "move":
                     var move=MovementRules.Evaluate(current.X,current.Z,command.Dx,command.Dz,time-session.LastMove,current.RegionId);
                     code=move.Code;
@@ -191,6 +201,7 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         if(!players.TryGetValue(session.Name,out var selected))return result;
         result.InWorld=true;result.SelectedCharacterId=selected.Id;result.RegionId=selected.RegionId;result.ChannelId=session.Channel;
         var room=GetRoom(session.Channel,selected.RegionId);
+        result.Chat.AddRange(room.Chat.After(session.ChatAfter));
         result.Monster=new MonsterView{X=3,Z=0,Hp=room.Hp,MaxHp=3};
         result.Players.AddRange(players.Where(p=>p.Value.RegionId==selected.RegionId&&channels.TryGetValue(p.Key,out var channel)&&channel==session.Channel).OrderBy(p=>p.Key).Select(p=>new PlayerView {
             Name=p.Key,CharacterId=p.Value.Id,DisplayName=p.Value.Name,Appearance=p.Value.Look.ToProtocol(),X=p.Value.X,Z=p.Value.Z,

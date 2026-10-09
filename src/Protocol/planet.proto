@@ -17,6 +17,15 @@ message Command {
   string realm_id = 11;
   string portal_id = 12;
   int32 channel_id = 13;
+  string chat_text = 14;
+  int64 chat_after = 15;
+}
+message ChatMessage {
+  int64 id = 1;
+  string sender = 2;
+  string text = 3;
+  int32 channel_id = 4;
+  string region_id = 5;
 }
 message Appearance {
   string archetype = 1;
@@ -68,4 +77,5 @@ message Update {
   string region_id = 10;
   int32 channel_id = 11;
   repeated ChannelView channels = 12;
+  repeated ChatMessage chat = 13;
 }
