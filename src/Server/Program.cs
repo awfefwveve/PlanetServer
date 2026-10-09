@@ -25,7 +25,16 @@ var running = host.Run();
 var stopFile = Path.Combine(directory, "stop.request");
 async Task WatchStopFile()
 {
-    while (!File.Exists(stopFile) && !stop.Task.IsCompleted) await Task.Delay(250);
+    int.TryParse(Environment.GetEnvironmentVariable("PLANET_LAUNCHER_PID"),out var parentId);
+    long.TryParse(Environment.GetEnvironmentVariable("PLANET_LAUNCHER_STARTED"),out var parentStarted);
+    while (!File.Exists(stopFile) && !stop.Task.IsCompleted) {
+        if(parentId>0 && parentStarted>0) {
+            try {using var parent=System.Diagnostics.Process.GetProcessById(parentId);if(parent.HasExited||parent.StartTime.ToUniversalTime().Ticks!=parentStarted)break;}
+            catch(ArgumentException){break;}
+            catch(InvalidOperationException){break;}
+        }
+        await Task.Delay(250);
+    }
 }
 await Task.WhenAny(running, stop.Task, WatchStopFile());
 await host.DisposeAsync();

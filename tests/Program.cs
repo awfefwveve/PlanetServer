@@ -345,6 +345,10 @@ try{await admissionWorld.Disconnect(entrants[2]);}catch(IOException){}
 admissionStore.Fail=false;
 Check((await Admit(winner,"enter_world",1)).Code=="ok","disconnect save failure still releases admission seat");
 Check((await Admit(winner,"snapshot")).Channels.All(c=>c.Reserved==0&&c.Online<=c.Capacity),"completed requests leave no leaked reservations");
+Check(Regions.BlockReason("meadow",4,6.4f)=="blocked","cliff face cannot be walked through");
+Check(Regions.BlockReason("meadow",0,6.4f)=="ok","central stairs remain traversable");
+Check(RegionTerrain.Height("meadow",0,8)==1.6f,"staircase reaches plateau height");
+Check(Regions.BlockReason("coast",4,6.4f)=="ok","meadow cliff does not affect other regions");
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore

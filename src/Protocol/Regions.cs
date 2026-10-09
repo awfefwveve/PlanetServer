@@ -37,6 +37,7 @@ namespace Planet.Protocol
             if(Find(id)==null)return "unknown_region";
             if(float.IsNaN(x)||float.IsInfinity(x)||float.IsNaN(z)||float.IsInfinity(z))return "invalid";
             if(Math.Abs(x)>HalfWidth||Math.Abs(z)>HalfDepth)return "boundary";
+            if(RegionTerrain.BlocksCliff(id,x,z))return "blocked";
             for(int i=0;i<MeadowMap.RockX.Length;i++) {
                 float dx=x-MeadowMap.RockX[i],dz=z-MeadowMap.RockZ[i],r=MeadowMap.RockRadius+MeadowMap.PlayerRadius;
                 if(dx*dx+dz*dz<r*r)return "blocked";

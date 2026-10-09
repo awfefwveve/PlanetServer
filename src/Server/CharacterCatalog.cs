@@ -31,7 +31,7 @@ public sealed class CharacterCatalog(IStore store)
         var characters=account.Characters??[];
         if(characters.Length>=12)return ("slots_full",account);
         var a=command.Appearance;
-        if(a is null || !new[]{"모험가","나린","에리프","루나"}.Contains(a.Archetype) ||
+        if(a is null || !new[]{"모험가","나린","에리프","루나","전사","마법사","궁수","도적","타니"}.Contains(a.Archetype) ||
            a.Gender<0||a.Gender>1||a.Skin<0||a.Skin>2||a.Face<0||a.Face>2||a.Hair<0||a.Hair>2||a.HairColor<0||a.HairColor>2)
             return ("invalid_appearance",account);
         string code=await CheckName(command.DisplayName);
