@@ -19,6 +19,7 @@ message Command {
   int32 channel_id = 13;
   string chat_text = 14;
   int64 chat_after = 15;
+  string target_id = 16;
 }
 message ChatMessage {
   int64 id = 1;
@@ -57,6 +58,8 @@ message MonsterView {
   float z = 2;
   int32 hp = 3;
   int32 max_hp = 4;
+  string id = 5;
+  string spawn_zone = 6;
 }
 message ChannelView {
   int32 id = 1;
@@ -78,4 +81,5 @@ message Update {
   int32 channel_id = 11;
   repeated ChannelView channels = 12;
   repeated ChatMessage chat = 13;
+  repeated MonsterView monsters = 14;
 }

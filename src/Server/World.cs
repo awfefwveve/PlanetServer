@@ -32,10 +32,10 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
     private readonly ConcurrentDictionary<string, CharacterData> players = new();
     private readonly CharacterCatalog catalog=new(store);
     private readonly Func<double> now = clock ?? (() => (double)Stopwatch.GetTimestamp() / Stopwatch.Frequency);
-    private sealed class Room {public int Hp=3;public double RespawnAt;public readonly RoomChat Chat=new();}
+    private sealed class Room(int channel,string region) {public readonly MonsterPopulation Monsters=new(channel,region);public readonly RoomChat Chat=new();}
     private readonly ConcurrentDictionary<string,Room> rooms=new();
     private readonly ConcurrentDictionary<string,int> channels=new();
-    private Room GetRoom(int channel,string region){string key=channel+":"+region;if(!rooms.TryGetValue(key,out var room)){room=rooms.GetOrAdd(key,_=>new Room());}if(room.Hp==0&&now()>=room.RespawnAt)room.Hp=3;return room;}
+    private Room GetRoom(int channel,string region){string key=channel+":"+region;if(!rooms.TryGetValue(key,out var room)){room=rooms.GetOrAdd(key,_=>new Room(channel,region));}room.Monsters.Refresh(now());return room;}
     private long tick;
     private long chatId;
 
@@ -99,12 +99,14 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
                 case "attack":
                     if(time-session.LastAttack<.4){code="cooldown";break;}
                     session.LastAttack=time;
-                    if(room.Hp==0){code="no_target";break;}
-                    if((current.X-3)*(current.X-3)+current.Z*current.Z>2.25f){code="out_of_range";break;}
-                    if(room.Hp>1){room.Hp--;break;}
+                    // Empty target is retained only for the original demo client.
+                    var target=string.IsNullOrEmpty(command.TargetId)?room.Monsters.Primary:room.Monsters.Find(command.TargetId);
+                    if(target is null||target.Hp==0){code="no_target";break;}
+                    if((current.X-target.X)*(current.X-target.X)+(current.Z-target.Z)*(current.Z-target.Z)>2.25f){code="out_of_range";break;}
+                    if(target.Hp>1){target.Damage();break;}
                     var reward=current with {Kills=current.Kills+1,Shards=current.Shards+1};
                     await SaveProgress(name,reward);
-                    players[name]=reward;room.Hp=0;room.RespawnAt=time+3;message="Slime defeated. +1 shard. Progress saved.";
+                    players[name]=reward;target.CommitDeath(now());message="Slime defeated. +1 shard. Progress saved.";
                     break;
                 case "claim":
                     if(current.QuestClaimed){code="already_claimed";break;}
@@ -202,7 +204,8 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         result.InWorld=true;result.SelectedCharacterId=selected.Id;result.RegionId=selected.RegionId;result.ChannelId=session.Channel;
         var room=GetRoom(session.Channel,selected.RegionId);
         result.Chat.AddRange(room.Chat.After(session.ChatAfter));
-        result.Monster=new MonsterView{X=3,Z=0,Hp=room.Hp,MaxHp=3};
+        result.Monster=room.Monsters.Primary.View(); // Compatibility with the earlier demo.
+        result.Monsters.AddRange(room.Monsters.Snapshot());
         result.Players.AddRange(players.Where(p=>p.Value.RegionId==selected.RegionId&&channels.TryGetValue(p.Key,out var channel)&&channel==session.Channel).OrderBy(p=>p.Key).Select(p=>new PlayerView {
             Name=p.Key,CharacterId=p.Value.Id,DisplayName=p.Value.Name,Appearance=p.Value.Look.ToProtocol(),X=p.Value.X,Z=p.Value.Z,
             Kills=p.Value.Kills,Shards=p.Value.Shards,Gold=p.Value.Gold,QuestClaimed=p.Value.QuestClaimed

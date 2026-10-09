@@ -349,6 +349,50 @@ Check(Regions.BlockReason("meadow",4,6.4f)=="blocked","cliff face cannot be walk
 Check(Regions.BlockReason("meadow",0,6.4f)=="ok","central stairs remain traversable");
 Check(RegionTerrain.Height("meadow",0,8)==1.6f,"staircase reaches plateau height");
 Check(Regions.BlockReason("coast",4,6.4f)=="ok","meadow cliff does not affect other regions");
+// Multi-monster combat: explicit targets, scoped ownership, save-before-death,
+// concurrent lethal hits, and incarnation IDs that reject delayed old attacks.
+var monsterStore=new FaultStore(new FileStore(Path.Combine(dir,"monsters")));
+foreach(var name in new[]{"hunterone","huntertwo"})await monsterStore.Save(Account.Create(name,"test-pass-123") with {X=7,Z=-4},null);
+await monsterStore.Save(Account.Create("foresthunter","test-pass-123") with {X=3,Z=0,RegionId="forest"},null);
+double combatTime=1000;var combatWorld=new World(monsterStore,()=>combatTime);
+var hunterOne=new Session();var hunterTwo=new Session();var forestHunter=new Session();ulong combatSequence=0;
+Task<Update> CombatSend(Session session,string kind,string target="",string name="hunterone",int channel=0)=>combatWorld.Handle(session,new Command{Sequence=++combatSequence,Kind=kind,TargetId=target,Name=name,Password="test-pass-123",ChannelId=channel});
+var populated=await CombatSend(hunterOne,"login");await CombatSend(hunterTwo,"login",name:"huntertwo");
+var forestPopulation=await CombatSend(forestHunter,"login",name:"foresthunter");
+Check(populated.Monsters.Count==5&&populated.Monsters.Select(m=>m.Id).Distinct().Count()==5,"meadow publishes five unique monster IDs");
+Check(populated.Monsters.All(m=>Regions.BlockReason("meadow",m.X,m.Z)=="ok"),"all spawn slots are walkable");
+Check(Update.Parser.ParseFrom(populated.ToByteArray()).Monsters.Count==5,"monster list survives Protobuf round trip");
+var targetMonster=populated.Monsters.Single(m=>m.X==7&&m.Z==-4);string targetId=targetMonster.Id;
+Check((await CombatSend(hunterOne,"attack","invented-id")).Code=="no_target","unknown target ID rejected");
+combatTime+=1;
+Check((await CombatSend(hunterOne,"attack",forestPopulation.Monsters[0].Id)).Code=="no_target","another region's monster ID rejected");
+combatTime+=1;
+Check((await CombatSend(hunterOne,"attack",populated.Monsters.Single(m=>m.X==11).Id)).Code=="out_of_range","explicit distant target rejected");
+combatTime+=1;
+var firstHit=await CombatSend(hunterOne,"attack",targetId);
+Check(firstHit.Monsters.Single(m=>m.Id==targetId).Hp==2&&firstHit.Monsters.Where(m=>m.Id!=targetId).All(m=>m.Hp==3),"targeted damage leaves other monsters unchanged");
+combatTime+=1;await CombatSend(hunterOne,"attack",targetId);
+monsterStore.Fail=true;combatTime+=1;bool monsterSaveFailed=false;
+try{await CombatSend(hunterOne,"attack",targetId);}catch(IOException){monsterSaveFailed=true;}
+var uncommitted=await CombatSend(hunterTwo,"snapshot");
+Check(monsterSaveFailed&&uncommitted.Monsters.Single(m=>m.Id==targetId).Hp==1&&uncommitted.Players.Sum(p=>p.Shards)==0,"failed lethal save keeps monster alive and awards nothing");
+monsterStore.Fail=false;combatTime+=1;
+var lethalRace=await Task.WhenAll(CombatSend(hunterOne,"attack",targetId),CombatSend(hunterTwo,"attack",targetId));
+Check(lethalRace.Count(r=>r.Code=="ok")==1&&lethalRace.Count(r=>r.Code=="no_target")==1,"simultaneous lethal requests commit one death");
+var afterKill=await CombatSend(hunterTwo,"snapshot");
+Check(afterKill.Players.Sum(p=>p.Kills)==1&&afterKill.Players.Sum(p=>p.Shards)==1,"one monster grants exactly one kill and shard across players");
+Check(afterKill.Monsters.Single(m=>m.Id==targetId).Hp==0,"peer sees the same dead monster");
+combatTime+=2.9;
+Check((await CombatSend(hunterTwo,"snapshot")).Monsters.Single(m=>m.Id==targetId).Hp==0,"monster does not respawn before its deadline");
+combatTime+=.2;var respawned=await CombatSend(hunterOne,"snapshot");
+var newLife=respawned.Monsters.Single(m=>m.X==7&&m.Z==-4);
+Check(newLife.Id!=targetId&&newLife.Hp==3&&respawned.Monsters.Count==5,"respawn restores only its slot with a fresh incarnation ID");
+Check((await CombatSend(hunterOne,"attack",targetId)).Code=="no_target","delayed attack cannot damage a new incarnation");
+combatTime+=1;await CombatSend(hunterTwo,"switch_channel",channel:2);
+Check((await CombatSend(hunterTwo,"attack",newLife.Id)).Code=="no_target","another channel's monster ID rejected");
+await combatWorld.Disconnect(hunterOne);await combatWorld.Disconnect(hunterTwo);await combatWorld.Disconnect(forestHunter);
+var storedHunters=await Task.WhenAll(monsterStore.Load("hunterone"),monsterStore.Load("huntertwo"));
+Check(storedHunters.Sum(a=>a!.Shards)==1&&storedHunters.Sum(a=>a!.Kills)==1,"single lethal reward persists after both hunters disconnect");
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore
