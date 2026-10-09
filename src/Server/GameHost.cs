@@ -10,12 +10,13 @@ using Planet.Protocol;
 
 namespace Planet.Server;
 
-public sealed class GameHost(World world, X509Certificate2 certificate, int port) : IAsyncDisposable
+public sealed class GameHost(World world, X509Certificate2 certificate, int port, int maxConnections=128) : IAsyncDisposable
 {
     private readonly TcpListener listener = new(IPAddress.Loopback, port);
     private readonly CancellationTokenSource shutdown = new();
     private readonly List<Task> clients = [];
-    private readonly SemaphoreSlim slots = new(16, 16);
+    private readonly SemaphoreSlim slots = new(ValidateLimit(maxConnections), ValidateLimit(maxConnections));
+    private static int ValidateLimit(int value)=>value is >=1 and <=4096?value:throw new ArgumentOutOfRangeException(nameof(value));
     public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
     public void Start() => listener.Start();
     public async Task Run()

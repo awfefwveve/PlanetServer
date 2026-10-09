@@ -11,7 +11,9 @@ var connection = Environment.GetEnvironmentVariable("PLANET_DB");
 IStore store;
 if (string.IsNullOrWhiteSpace(connection)) store = new FileStore(Path.Combine(directory, "accounts"));
 else { var postgres = new PostgresStore(connection); await postgres.Initialize(); store = postgres; }
-var host = new GameHost(new World(store), certificate, 7777);
+var capacityText=Environment.GetEnvironmentVariable("PLANET_MAX_CONNECTIONS");
+var capacity=string.IsNullOrEmpty(capacityText)?128:int.Parse(capacityText);
+var host = new GameHost(new World(store), certificate, 7777, capacity);
 host.Start();
 GameHost.Log("listening", null, $"127.0.0.1:{host.Port}; storage={(string.IsNullOrWhiteSpace(connection) ? "local-development" : "postgresql")}");
 Console.WriteLine("Planet server running. Press Ctrl+C to save and stop.");

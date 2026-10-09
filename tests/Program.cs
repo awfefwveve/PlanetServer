@@ -255,6 +255,27 @@ time+=2;var differentChannel=await RegionSend(traveler,"switch_channel",channel:
 Check(differentChannel.ChannelId==30&&differentChannel.Players.Count==1&&differentChannel.Monster.Hp==3,"channel thirty isolates players and monsters");
 Check((await RegionSend(traveler,"switch_channel",channel:31)).Code=="invalid_channel","out of range channel rejected");
 Check(Regions.BlockReason("meadow",18.2f,0)=="boundary"&&Regions.BlockReason("coast",0,22.2f)=="boundary","unopened region edges cannot be walked through");
+// A deliberately stalled durable write must not stop an unrelated channel.
+var delayed=new DelayedStore(new FileStore(Path.Combine(dir,"parallel")));
+string fastName="fastuser";
+while(((uint)StringComparer.Ordinal.GetHashCode(fastName)%256)==((uint)StringComparer.Ordinal.GetHashCode("slowuser")%256))fastName+="x";
+await delayed.Save(Account.Create("slowuser","test-pass-123") with {Kills=3},null);
+double parallelTime=100;var parallelWorld=new World(delayed,()=>parallelTime);var slowSession=new Session();var fastSession=new Session();
+await parallelWorld.Handle(slowSession,new Command{Sequence=1,Kind="login",Name="slowuser",Password="test-pass-123"});
+await parallelWorld.Handle(fastSession,new Command{Sequence=1,Kind="login",Name=fastName,Password="test-pass-123"});
+await parallelWorld.Handle(fastSession,new Command{Sequence=2,Kind="switch_channel",ChannelId=30});
+delayed.Block=true;
+var stalled=parallelWorld.Handle(slowSession,new Command{Sequence=2,Kind="claim"});
+await delayed.Entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+try {
+    var independent=await parallelWorld.Handle(fastSession,new Command{Sequence=3,Kind="move",Dx=1}).WaitAsync(TimeSpan.FromSeconds(2));
+    Check(independent.Code=="ok"&&!stalled.IsCompleted,"other channel moves while reward persistence is stalled");
+} finally {delayed.Release.TrySetResult();}
+Check((await stalled).Players.Single().Gold==100,"stalled reward commits once after storage resumes");
+parallelTime+=2;var swapA=parallelWorld.Handle(slowSession,new Command{Sequence=3,Kind="switch_channel",ChannelId=30});
+var swapB=parallelWorld.Handle(fastSession,new Command{Sequence=4,Kind="switch_channel",ChannelId=1});
+await Task.WhenAll(swapA,swapB).WaitAsync(TimeSpan.FromSeconds(3));
+Check(swapA.Result.Code=="ok" && swapB.Result.Code=="ok","opposing channel requests finish without deadlock");
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore
@@ -264,4 +285,13 @@ sealed class FaultStore(IStore inner) : IStore
     public Task<bool> CharacterNameExists(string name) => inner.CharacterNameExists(name);
     public Task Save(Account account, long? expectedRevision) => Fail
         ? Task.FromException(new IOException("Injected storage failure")) : inner.Save(account, expectedRevision);
+}
+
+sealed class DelayedStore(IStore inner):IStore {
+    public bool Block;
+    public readonly TaskCompletionSource Entered=new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public readonly TaskCompletionSource Release=new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public Task<Account?> Load(string name)=>inner.Load(name);
+    public Task<bool> CharacterNameExists(string name)=>inner.CharacterNameExists(name);
+    public async Task Save(Account account,long? revision) {if(Block&&account.Name=="slowuser"){Entered.TrySetResult();await Release.Task;}await inner.Save(account,revision);}
 }
