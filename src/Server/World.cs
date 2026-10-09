@@ -41,16 +41,10 @@ public sealed class World(IStore store, Func<double>? clock = null)
             {
                 case "snapshot": break;
                 case "move":
-                    if (!float.IsFinite(command.Dx) || !float.IsFinite(command.Dz)) { code = "invalid"; break; }
-                    if (time - session.LastMove < .08) { code = "rate_limited"; break; }
-                    var length = Math.Sqrt((double)command.Dx * command.Dx + (double)command.Dz * command.Dz);
-                    if (length > 1.01) { code = "invalid"; break; }
-                    session.LastMove = time;
-                    // At most 0.24 units per accepted input; idle time cannot accumulate movement credit.
-                    var x = current.X + command.Dx * .24f;
-                    var z = current.Z + command.Dz * .24f;
-                    if (x*x + z*z > 49) { code = "boundary"; break; }
-                    players[current.Name] = current with { X = x, Z = z };
+                    var move = MovementRules.Evaluate(current.X, current.Z, command.Dx, command.Dz, time-session.LastMove);
+                    code = move.Code;
+                    if (code != "invalid" && code != "rate_limited") session.LastMove = time;
+                    if (code == "ok") players[current.Name] = current with { X = move.X, Z = move.Z };
                     break;
                 case "attack":
                     if (time - session.LastAttack < .4) { code = "cooldown"; break; }
@@ -121,3 +115,4 @@ public sealed class World(IStore store, Func<double>? clock = null)
         return result;
     }
 }
+

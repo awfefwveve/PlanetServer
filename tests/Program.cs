@@ -148,6 +148,25 @@ if (!string.IsNullOrEmpty(db))
         "PostgreSQL world restores completed quest after restart");
 }
 else Console.WriteLine("SKIP: PostgreSQL integration (PLANET_TEST_DB not set)");
+// Movement policy and actual world regression checks for the shared meadow map.
+var diagonal=MovementRules.Evaluate(0,0,(float)(1/Math.Sqrt(2)),(float)(1/Math.Sqrt(2)),.1);
+Check(diagonal.Code=="ok" && Math.Abs(Math.Sqrt(diagonal.X*diagonal.X+diagonal.Z*diagonal.Z)-.24)<.00001,"diagonal input does not increase speed");
+Check(MovementRules.Evaluate(0,0,1,1,.1).Code=="invalid","unnormalized diagonal cheat rejected");
+Check(MovementRules.Evaluate(6.96f,0,1,0,.1).Code=="boundary","walk boundary rejects crossing");
+Check(MovementRules.Evaluate(-3.1f,2,1,0,.1).Code=="blocked","rock includes player collision radius");
+Check(MovementRules.Evaluate(-3.1f,2,-1,0,.1).Code=="ok","player can move away from rock");
+Check(MovementRules.Evaluate(0,0,float.PositiveInfinity,0,.1).Code=="invalid","infinite input rejected");
+Check(Math.Abs(MovementRules.Evaluate(0,0,1,0,1000).X-.24f)<.00001,"idle time does not accumulate speed credit");
+var moveStore=new FileStore(Path.Combine(dir,"movement"));
+var moveWorld=new World(moveStore,()=>time);var mover=new Session();
+await moveWorld.Handle(mover,new Command{Sequence=1,Kind="login",Name="walker",Password="test-pass-123"});
+Update moveState=null!;
+for(ulong i=2;i<42;i++){time+=.1;moveState=await moveWorld.Handle(mover,new Command{Sequence=i,Kind="move",Dx=1});}
+Check(moveState.Code=="boundary" && moveState.Players.Single().X<=7,"world enforces boundary under repeated requests");
+float lastX=moveState.Players.Single().X;
+await moveWorld.Disconnect(mover);
+var reloaded=await new World(moveStore,()=>time).Handle(new Session(),new Command{Sequence=1,Kind="login",Name="walker",Password="test-pass-123"});
+Check(Math.Abs(reloaded.Players.Single().X-lastX)<.00001,"accepted movement survives disconnect and reload");
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore
