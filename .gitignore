@@ -17,3 +17,4 @@ ui-captures/
 UnityClient/Assets/StreamingAssets/server-pin.txt
 UnityClient/Assets/Plugins/*.dll
 
+/data-editor/
