@@ -4,7 +4,7 @@ namespace Planet.Protocol
     // Shared level dimensions. Gameplay uses X/Z; height is presentation derived from them.
     public static class RegionTerrain
     {
-        public const float StairHalfWidth=2.3f,StairStart=4,StairEnd=8,PlateauHeight=1.6f;
+        public const float StairHalfWidth=2.5f,StairStart=4,StairEnd=8,PlateauHeight=1.6f;
         public static float Height(string region,float x,float z)
         {
             if(region!="meadow")return 0;
