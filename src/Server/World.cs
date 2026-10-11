@@ -19,7 +19,7 @@ public sealed class Session
     public long ChatAfter;
 }
 
-public sealed class World(IStore store, Func<double>? clock = null, int channelCapacity=32)
+public sealed class World(IStore store, Func<double>? clock = null, int channelCapacity=1000)
 {
     // A bounded account stripe protects duplicate login across sessions. Channel ownership
     // serializes shared gameplay only within a channel; unrelated channels can progress.
@@ -179,7 +179,7 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
     private async Task SaveProgress(string name,CharacterData character)
     {
         var account=accounts[name];Account saved;
-        if(character.Id=="legacy")saved=account with {X=character.X,Z=character.Z,Kills=character.Kills,Shards=character.Shards,Gold=character.Gold,QuestClaimed=character.QuestClaimed,RegionId=character.RegionId,Revision=account.Revision+1};
+        if(character.Id=="legacy")saved=account with {X=character.X,Z=character.Z,Kills=character.Kills,Shards=character.Shards,Gold=character.Gold,QuestClaimed=character.QuestClaimed,RegionId=character.RegionId,Progress=character.Progress,Revision=account.Revision+1};
         else saved=account with {Characters=account.Characters!.Select(c=>c.Id==character.Id?character:c).ToArray(),Revision=account.Revision+1};
         await store.Save(saved,account.Revision);accounts[name]=saved;
     }
@@ -201,6 +201,7 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         var account=accounts[session.Name];
         if(session.LobbyLogin)result.Characters.AddRange((account.Characters??[]).Select(c=>c.ToProtocol()));
         if(!players.TryGetValue(session.Name,out var selected))return result;
+        result.SelfStats=CharacterStatsRules.View(selected.Progress);
         result.InWorld=true;result.SelectedCharacterId=selected.Id;result.RegionId=selected.RegionId;result.ChannelId=session.Channel;
         var room=GetRoom(session.Channel,selected.RegionId);
         result.Chat.AddRange(room.Chat.After(session.ChatAfter));

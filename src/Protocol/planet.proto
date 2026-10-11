@@ -67,6 +67,17 @@ message ChannelView {
   int32 reserved = 3;
   int32 capacity = 4;
 }
+message CharacterStats {
+  int32 level = 1;
+  int64 experience = 2;
+  int64 next_level_experience = 3;
+  int32 hp = 4;
+  int32 max_hp = 5;
+  int32 mp = 6;
+  int32 max_mp = 7;
+  int32 attack = 8;
+  int32 defense = 9;
+}
 message Update {
   uint64 sequence = 1;
   string code = 2;
@@ -82,4 +93,5 @@ message Update {
   repeated ChannelView channels = 12;
   repeated ChatMessage chat = 13;
   repeated MonsterView monsters = 14;
+  CharacterStats self_stats = 15;
 }

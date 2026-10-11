@@ -10,7 +10,7 @@ using Planet.Protocol;
 
 namespace Planet.Server;
 
-public sealed class GameHost(World world, X509Certificate2 certificate, int port, int maxConnections=128) : IAsyncDisposable
+public sealed class GameHost(World world, X509Certificate2 certificate, int port, int maxConnections=1000) : IAsyncDisposable
 {
     private readonly TcpListener listener = new(IPAddress.Loopback, port);
     private readonly CancellationTokenSource shutdown = new();

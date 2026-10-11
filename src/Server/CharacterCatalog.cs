@@ -11,10 +11,10 @@ public sealed record CharacterLook(string Archetype = "모험가", int Gender = 
     public static CharacterLook From(Appearance a) => new(a.Archetype,a.Gender,a.Skin,a.Face,a.Hair,a.HairColor);
 }
 public sealed record CharacterData(string Id, string Name, CharacterLook Look, float X=0,float Z=0,
-    int Kills=0,int Shards=0,int Gold=0,bool QuestClaimed=false,string RegionId="meadow")
+    int Kills=0,int Shards=0,int Gold=0,bool QuestClaimed=false,string RegionId="meadow",CharacterProgress? Progress=null)
 {
     public CharacterInfo ToProtocol()=>new(){Id=Id,Name=Name,Appearance=Look.ToProtocol()};
-    public static CharacterData Legacy(Account a)=>new("legacy",a.Name,new(),a.X,a.Z,a.Kills,a.Shards,a.Gold,a.QuestClaimed,a.RegionId);
+    public static CharacterData Legacy(Account a)=>new("legacy",a.Name,new(),a.X,a.Z,a.Kills,a.Shards,a.Gold,a.QuestClaimed,a.RegionId,a.Progress);
 }
 public sealed class CharacterCatalog(IStore store)
 {
@@ -36,7 +36,7 @@ public sealed class CharacterCatalog(IStore store)
             return ("invalid_appearance",account);
         string code=await CheckName(command.DisplayName);
         if(code!="ok")return (code,account);
-        var character=new CharacterData(Guid.NewGuid().ToString("N"),Normalize(command.DisplayName),CharacterLook.From(a));
+        var character=new CharacterData(Guid.NewGuid().ToString("N"),Normalize(command.DisplayName),CharacterLook.From(a),X:-6.2f,Z:-2.2f,Progress:new CharacterProgress());
         var updated=account with {Characters=[..characters,character],Revision=account.Revision+1};
         await store.Save(updated,account.Revision);
         return ("ok",updated);
