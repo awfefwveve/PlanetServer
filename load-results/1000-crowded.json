@@ -1,0 +1,29 @@
+{
+  "requestedClients": 1000,
+  "admitted": 995,
+  "activeAtStart": 691,
+  "activeAtEnd": 691,
+  "scenario": "crowded",
+  "channels": 1,
+  "seconds": 20.1177852,
+  "attempts": 50913,
+  "replies": 50531,
+  "requestsPerSecond": 2511.757606398939,
+  "p50Ms": 120.9634,
+  "p95Ms": 422.4823,
+  "p99Ms": 538.8679,
+  "errors": {
+    "setup:EndOfStreamException:Attempted to read past the end of the stream.": 5,
+    "warmup:EndOfStreamException:Attempted to read past the end of the stream.": 304
+  },
+  "serverCpuSeconds": 30.21875,
+  "generatorCpuSeconds": 15.4375,
+  "serverCpuMachinePercent": 4.694035293209115,
+  "generatorCpuMachinePercent": 2.3979870060447808,
+  "logicalProcessors": 32,
+  "peakServerWorkingSet": 164265984,
+  "peakGeneratorWorkingSet": 193978368,
+  "receivedBytes": 1620768011,
+  "scope": "Separate server and generator processes, SAME computer; loopback TCP/TLS/Protobuf, file store, move/snapshot only. Closed-loop: 100ms delay AFTER response; slower server reduces offered load. Setup, disconnect saves and PostgreSQL excluded. NOT a production capacity certification.",
+  "dataDirectory": "C:\\Users\\USER\\Documents\\Codex\\2026-10-09\\new-chat\\outputs\\PlanetServer\\load-results\\run-39635a2a2cdb4fe5901ec503955923d3"
+}
