@@ -417,6 +417,31 @@ Check((await authWorld.Handle(new Session(),new Command{Sequence=1,Kind="charact
 await authWorld.Disconnect(authOwner);
 var authReturning=new Session();Check((await authWorld.Handle(authReturning,Auth("authenticate"))).Code=="ok","login succeeds after logout");
 await authWorld.Disconnect(authReturning);
+
+var travelStorage=new FaultStore(new FileStore(Path.Combine(dir,"transport")));
+await travelStorage.Save(Account.Create("transportTester","test-pass-123") with {X=-6.2f,Z=-2.2f},null);
+double travelTime=100;var travelWorld=new World(travelStorage,()=>travelTime);var transportTester=new Session();ulong travelSeq=0;
+Task<Update> TravelCommand(string kind,string target="")=>travelWorld.Handle(transportTester,new Command{Sequence=++travelSeq,Kind=kind,TargetId=target,Name="transportTester",Password="test-pass-123"});
+await TravelCommand("login");
+Check((await TravelCommand("travel_begin","invented")).Code=="travel_denied","unknown transport route rejected");
+var departure=await TravelCommand("travel_begin","meadow_coast");string journeyTicket=departure.Message;
+Check(departure.Code=="ok"&&journeyTicket.Length==32,"station grants travel ticket");
+Check((await TravelCommand("move")).Code=="in_transit","travel locks gameplay requests");
+Check((await TravelCommand("travel_commit","wrong-ticket")).Code=="travel_invalid","travel ticket ownership enforced");
+Check((await TravelCommand("travel_commit",journeyTicket)).Code=="travel_too_early","departure cannot be bypassed");
+travelTime+=13;travelStorage.Fail=true;
+Check((await TravelCommand("travel_commit",journeyTicket)).Code=="save_failed","failed arrival save rejected");travelStorage.Fail=false;
+Check((await TravelCommand("snapshot")).RegionId=="meadow","save failure retains source region");
+var landed=await TravelCommand("travel_commit",journeyTicket);
+Check(landed.Code=="ok"&&landed.RegionId=="coast"&&landed.ChannelId==1,"airship changes region while preserving channel");
+var revision=(await travelStorage.Load("transportTester"))!.Revision;
+Check((await TravelCommand("travel_commit",journeyTicket)).Code=="ok"&&(await travelStorage.Load("transportTester"))!.Revision==revision,"repeated commit does not save twice");
+Check((await TravelCommand("travel_finish",journeyTicket)).Code=="ok","landing unlocks player");
+Check((await TravelCommand("travel_finish",journeyTicket)).Code=="ok","landing retry idempotent");
+travelTime+=2;var returning=await TravelCommand("travel_begin","coast_meadow");await travelWorld.Disconnect(transportTester);
+Check((await travelStorage.Load("transportTester"))!.RegionId=="coast","disconnect before commit restores departure region");
+transportTester=new Session();travelSeq=0;await TravelCommand("login");returning=await TravelCommand("travel_begin","coast_meadow");travelTime+=13;await TravelCommand("travel_commit",returning.Message);await travelWorld.Disconnect(transportTester);
+Check((await travelStorage.Load("transportTester"))!.RegionId=="meadow","disconnect after commit restores destination");
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore

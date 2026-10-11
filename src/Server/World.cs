@@ -8,6 +8,7 @@ namespace Planet.Server;
 public sealed class Session
 {
     public string? Name;
+    public TransportRoute? Travel;public string TravelTicket="",CompletedTravel="";public double TravelStarted;public bool TravelCommitted;
     public bool LobbyLogin;
     public int Channel=1;
     public double LastTransfer=double.NegativeInfinity;
@@ -57,6 +58,8 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             if(command.Kind is "login" or "authenticate" or "register")return await Login(session,command);
             if(session.Name is null)return Snapshot(session,command.Sequence,"unauthorized");
             string name=session.Name,code="ok",message="";
+            if(session.Travel!=null&&time-session.TravelStarted>90){session.Travel=null;session.TravelTicket="";session.TravelCommitted=false;}
+            if(session.Travel!=null&&command.Kind!="snapshot"&&!command.Kind.StartsWith("travel_"))return Snapshot(session,command.Sequence,"in_transit");
             if(command.Kind is "characters" or "check_name" or "create_character" or "enter_world" or "leave_world") {
                 try {await catalogGate.WaitAsync();try {code=await Lobby(session,command,reservation);}finally {catalogGate.Release();}}
                 catch(Npgsql.PostgresException e) when(e.SqlState=="23505"){code="name_taken";}
@@ -80,6 +83,30 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
                     code=move.Code;
                     if(code!="invalid"&&code!="rate_limited")session.LastMove=time;
                     if(code=="ok")players[name]=current with {X=move.X,Z=move.Z};
+                    break;
+                case "travel_begin":
+                    if(session.Travel!=null){code="in_transit";break;}
+                    var route=TransportRoutes.Find(current.RegionId,command.TargetId);
+                    if(route==null||!TransportRoutes.Near(route.Vehicle,current.X,current.Z)){code="travel_denied";break;}
+                    if(time-session.LastTransfer<1){code="transfer_cooldown";break;}
+                    session.Travel=route;session.TravelTicket=Guid.NewGuid().ToString("N");session.TravelStarted=time;session.TravelCommitted=false;message=session.TravelTicket;
+                    break;
+                case "travel_commit":
+                    if(command.TargetId==session.CompletedTravel&&command.TargetId!=""){break;}
+                    if(session.Travel==null||command.TargetId!=session.TravelTicket){code="travel_invalid";break;}
+                    if(session.TravelCommitted)break;
+                    if(time-session.TravelStarted<8){code="travel_too_early";break;}
+                    var arrival=current with {RegionId=session.Travel.Target,X=TransportRoutes.StationX(session.Travel.Vehicle),Z=TransportRoutes.StationZ};
+                    try {await SaveProgress(name,arrival);}
+                    catch(Exception e) when(e is IOException or InvalidOperationException or Npgsql.NpgsqlException){code="save_failed";break;}
+                    players[name]=arrival;session.TravelCommitted=true;session.LastTransfer=time;session.LastMove=time;
+                    break;
+                case "travel_finish":
+                    if(command.TargetId==session.CompletedTravel&&command.TargetId!="")break;
+                    if(session.Travel==null||command.TargetId!=session.TravelTicket||!session.TravelCommitted){code="travel_invalid";break;}
+                    session.CompletedTravel=session.TravelTicket;session.Travel=null;session.TravelTicket="";session.TravelCommitted=false;break;
+                case "travel_cancel":
+                    if(session.Travel!=null&&command.TargetId==session.TravelTicket&&!session.TravelCommitted){session.Travel=null;session.TravelTicket="";}else code="travel_invalid";
                     break;
                 case "portal":
                     var portal=Regions.Nearby(current.RegionId,current.X,current.Z);
