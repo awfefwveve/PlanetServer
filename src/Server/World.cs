@@ -54,7 +54,7 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             if(command.Sequence==0||command.Sequence<=session.Sequence)return Snapshot(session,command.Sequence,"replay");
             session.Sequence=command.Sequence;
             session.ChatAfter=Math.Max(0,command.ChatAfter);
-            if(command.Kind=="login")return await Login(session,command);
+            if(command.Kind is "login" or "authenticate" or "register")return await Login(session,command);
             if(session.Name is null)return Snapshot(session,command.Sequence,"unauthorized");
             string name=session.Name,code="ok",message="";
             if(command.Kind is "characters" or "check_name" or "create_character" or "enter_world" or "leave_world") {
@@ -166,6 +166,8 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         var name=command.Name.ToLowerInvariant();
         if(!Regex.IsMatch(name,"^[a-z0-9_]{3,16}$")||command.Password.Length<8||command.Password.Length>128)return Snapshot(session,command.Sequence,"invalid_login");
         var account=await store.Load(name);
+        if(command.Kind=="authenticate"&&account is null)return Snapshot(session,command.Sequence,"invalid_login");
+        if(command.Kind=="register"&&account is not null)return Snapshot(session,command.Sequence,"account_exists");
         if(account is null){account=Account.Create(name,command.Password);await store.Save(account,null);}
         else if(!account.Verify(command.Password))return Snapshot(session,command.Sequence,"invalid_login");
         if(accounts.ContainsKey(name))return Snapshot(session,command.Sequence,"duplicate_login");

@@ -405,6 +405,18 @@ await statsWorld.Disconnect(statsSession);
 var reloadedStats=await statsStore.Load("statsuser");
 Check(reloadedStats!.Progress==statsAccount.Progress,"disconnect preserves progression");
 Check(CharacterStatsRules.View(null).Hp==275,"old saves without stats retain defaults");
+
+var authStore=new FileStore(Path.Combine(dir,"authentication"));var authWorld=new World(authStore);
+Command Auth(string kind,string password="test-pass-123")=>new Command{Sequence=1,Kind=kind,Name="authuser",Password=password,LobbyLogin=true};
+Check((await authWorld.Handle(new Session(),Auth("authenticate"))).Code=="invalid_login"&&await authStore.Load("authuser")==null,"unknown login does not create account");
+var authOwner=new Session();Check((await authWorld.Handle(authOwner,Auth("register"))).Code=="ok","explicit registration authenticates");
+Check((await authWorld.Handle(new Session(),Auth("register"))).Code=="account_exists","duplicate registration rejected");
+Check((await authWorld.Handle(new Session(),Auth("authenticate","wrong-pass-123"))).Code=="invalid_login","wrong password rejected");
+Check((await authWorld.Handle(new Session(),Auth("authenticate"))).Code=="duplicate_login","duplicate authenticated connection rejected");
+Check((await authWorld.Handle(new Session(),new Command{Sequence=1,Kind="characters"})).Code=="unauthorized","roster requires authentication");
+await authWorld.Disconnect(authOwner);
+var authReturning=new Session();Check((await authWorld.Handle(authReturning,Auth("authenticate"))).Code=="ok","login succeeds after logout");
+await authWorld.Disconnect(authReturning);
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore
