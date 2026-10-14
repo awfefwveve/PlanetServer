@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
+using Google.Protobuf;
 using Planet.Protocol;
 
 namespace Planet.Server;
@@ -18,6 +19,11 @@ public sealed class Session
     public int LoginAttempts;
     public double LastChat = double.NegativeInfinity;
     public long ChatAfter;
+    // Set at login from Command.subscribe_updates. Only subscribed sessions receive tick pushes.
+    public bool Subscribed;
+    // Supplied by the transport (GameHost). Must not block: it enqueues a serialized Update
+    // and returns false when the connection cannot keep up or is closing.
+    public Func<byte[], bool>? Deliver;
 }
 
 public sealed class World(IStore store, Func<double>? clock = null, int channelCapacity=1000)
@@ -39,6 +45,12 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
     private Room GetRoom(int channel,string region){string key=channel+":"+region;if(!rooms.TryGetValue(key,out var room)){room=rooms.GetOrAdd(key,_=>new Room(channel,region));}room.Monsters.Refresh(now());return room;}
     private long tick;
     private long chatId;
+    // Authenticated connections by account name. Written only under that account's gate.
+    private readonly ConcurrentDictionary<string,Session> online=new();
+    // 1 while a channel's tick is still running, so a stalled channel is skipped instead of queued.
+    private readonly int[] tickRunning=new int[Regions.ChannelCount+1];
+    private long oversizedPushes;
+    public long OversizedPushes=>Interlocked.Read(ref oversizedPushes);
 
     public async Task<Update> Handle(Session session, Command command)
     {
@@ -202,6 +214,7 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         using var legacyReservation=command.LobbyLogin?null:admission.Reserve(name,1);
         if(!command.LobbyLogin&&legacyReservation is null)return Snapshot(session,command.Sequence,"channel_full");
         accounts[name]=account;channels[name]=1;session.Name=name;session.LobbyLogin=command.LobbyLogin;
+        session.Subscribed=command.SubscribeUpdates;online[name]=session;
         if(!command.LobbyLogin){players[name]=CharacterData.Legacy(account);legacyReservation!.Commit();}
         return Snapshot(session,command.Sequence,"ok");
     }
@@ -219,27 +232,113 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         try {
             if(session.Name is null)return;var name=session.Name;
             try {if(players.TryGetValue(name,out var character))await SaveProgress(name,character);}
-            finally {players.TryRemove(name,out _);accounts.TryRemove(name,out _);channels.TryRemove(name,out _);admission.Remove(name);session.Name=null;}
+            finally {
+                online.TryRemove(new KeyValuePair<string,Session>(name,session));
+                players.TryRemove(name,out _);accounts.TryRemove(name,out _);channels.TryRemove(name,out _);admission.Remove(name);session.Name=null;
+            }
         } finally {channelGates[channel].Release();accountGate.Release();}
     }
+    // Reply to one command: per-player fields + the room the player stands in.
     private Update Snapshot(Session session,ulong sequence,string code,string message="")
     {
-        var result=new Update{Sequence=sequence,Code=code,Message=message,Tick=Interlocked.Increment(ref tick)};
+        var result=Personal(session,sequence,code,message,Interlocked.Increment(ref tick));
         if(session.Name is null)return result;
         result.Channels.AddRange(admission.Snapshot());
-        var account=accounts[session.Name];
+        if(!result.InWorld)return result;
+        var room=GetRoom(session.Channel,result.RegionId);
+        result.Chat.AddRange(room.Chat.After(session.ChatAfter));
+        AddRoomState(result,room,session.Channel,result.RegionId);
+        return result;
+    }
+    // Fields that differ per receiver. Never contains room-wide lists.
+    private Update Personal(Session session,ulong sequence,string code,string message,long tickValue)
+    {
+        var result=new Update{Sequence=sequence,Code=code,Message=message,Tick=tickValue};
+        if(session.Name is null||!accounts.TryGetValue(session.Name,out var account))return result;
         if(session.LobbyLogin)result.Characters.AddRange((account.Characters??[]).Select(c=>c.ToProtocol()));
         if(!players.TryGetValue(session.Name,out var selected))return result;
         result.SelfStats=CharacterStatsRules.View(selected.Progress);
         result.InWorld=true;result.SelectedCharacterId=selected.Id;result.RegionId=selected.RegionId;result.ChannelId=session.Channel;
-        var room=GetRoom(session.Channel,selected.RegionId);
-        result.Chat.AddRange(room.Chat.After(session.ChatAfter));
+        return result;
+    }
+    // Fields identical for everyone in one channel+region.
+    private void AddRoomState(Update result,Room room,int channel,string region)
+    {
         result.Monster=room.Monsters.Primary.View(); // Compatibility with the earlier demo.
         result.Monsters.AddRange(room.Monsters.Snapshot());
-        result.Players.AddRange(players.Where(p=>p.Value.RegionId==selected.RegionId&&channels.TryGetValue(p.Key,out var channel)&&channel==session.Channel).OrderBy(p=>p.Key).Select(p=>new PlayerView {
+        result.Players.AddRange(players.Where(p=>p.Value.RegionId==region&&channels.TryGetValue(p.Key,out var c)&&c==channel).OrderBy(p=>p.Key).Select(p=>new PlayerView {
             Name=p.Key,CharacterId=p.Value.Id,DisplayName=p.Value.Name,Appearance=p.Value.Look.ToProtocol(),X=p.Value.X,Z=p.Value.Z,
             Kills=p.Value.Kills,Shards=p.Value.Shards,Gold=p.Value.Gold,QuestClaimed=p.Value.QuestClaimed
         }));
-        return result;
+    }
+
+    // ---- Server tick: the world advances and is broadcast without waiting for client requests. ----
+
+    // Runs until cancelled. Each channel ticks independently: a channel blocked on a slow save
+    // is skipped this round instead of delaying the other 29 channels.
+    public async Task RunTicker(TimeSpan interval,CancellationToken token)
+    {
+        var running=new Task?[Regions.ChannelCount+1];
+        using var timer=new PeriodicTimer(interval);
+        try {
+            while(await timer.WaitForNextTickAsync(token)) {
+                foreach(int channel in ActiveChannels()) {
+                    if(Interlocked.CompareExchange(ref tickRunning[channel],1,0)!=0)continue;
+                    running[channel]=Task.Run(async()=> {
+                        try {await TickChannel(channel);}
+                        catch(Exception e) {GameHost.Log("tick_failed",null,channel+":"+e.GetType().Name);}
+                        finally {Volatile.Write(ref tickRunning[channel],0);}
+                    });
+                }
+            }
+        }
+        catch(OperationCanceledException) {}
+        await Task.WhenAll(running.OfType<Task>());
+    }
+    // Deterministic single tick for tests: every channel, awaited.
+    public Task TickOnce()=>Task.WhenAll(Enumerable.Range(1,Regions.ChannelCount).Select(TickChannel));
+
+    private HashSet<int> ActiveChannels()
+    {
+        var active=new HashSet<int>();
+        foreach(var entry in online)if(entry.Value.Subscribed&&players.ContainsKey(entry.Key))active.Add(entry.Value.Channel);
+        return active;
+    }
+
+    private async Task TickChannel(int channel)
+    {
+        await channelGates[channel].WaitAsync();
+        try {
+            // Membership is re-read under the gate: portal, channel switch and disconnect also hold it.
+            var members=new List<(Session Session,CharacterData Character)>();
+            foreach(var entry in online)
+                if(entry.Value.Subscribed&&entry.Value.Deliver!=null&&entry.Value.Channel==channel&&players.TryGetValue(entry.Key,out var character))
+                    members.Add((entry.Value,character));
+            if(members.Count==0)return;
+            var channelViews=admission.Snapshot();
+            var time=now();
+            foreach(var region in members.GroupBy(m=>m.Character.RegionId)) {
+                var room=GetRoom(channel,region.Key);
+                room.Monsters.Refresh(time); // Respawn is now driven by time, not by someone asking.
+                // Serialize the shared part ONCE per room. Protobuf defines concatenated encodings
+                // as a merge, so shared + personal bytes parse as one Update. This turns the
+                // per-tick cost from O(players x room size) into O(players + room size).
+                var shared=new Update{Push=true};
+                shared.Channels.AddRange(channelViews);
+                shared.Chat.AddRange(room.Chat.TakeUnpushed());
+                AddRoomState(shared,room,channel,region.Key);
+                var sharedBytes=shared.ToByteArray();
+                long tickValue=Interlocked.Increment(ref tick);
+                foreach(var (session,_) in region) {
+                    var personal=Personal(session,0,"tick","",tickValue).ToByteArray();
+                    if(sharedBytes.Length+personal.Length>Framing.MaximumBytes){Interlocked.Increment(ref oversizedPushes);continue;}
+                    var frame=new byte[sharedBytes.Length+personal.Length];
+                    Buffer.BlockCopy(sharedBytes,0,frame,0,sharedBytes.Length);
+                    Buffer.BlockCopy(personal,0,frame,sharedBytes.Length,personal.Length);
+                    session.Deliver!(frame); // false = transport is closing that connection; nothing to undo here.
+                }
+            }
+        }
+        finally {channelGates[channel].Release();}
     }
 }

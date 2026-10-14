@@ -20,6 +20,10 @@ message Command {
   string chat_text = 14;
   int64 chat_after = 15;
   string target_id = 16;
+  // Login only. true = this client also accepts server-initiated Update frames
+  // (push=true, sequence=0) between replies. Old clients omit it and keep
+  // strict request/response framing.
+  bool subscribe_updates = 17;
 }
 message ChatMessage {
   int64 id = 1;
@@ -94,4 +98,7 @@ message Update {
   repeated ChatMessage chat = 13;
   repeated MonsterView monsters = 14;
   CharacterStats self_stats = 15;
+  // true = produced by the server tick, not a reply. sequence is 0 and code is "tick".
+  // Replies and pushes may arrive out of tick order; clients keep the highest tick.
+  bool push = 16;
 }

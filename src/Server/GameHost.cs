@@ -5,6 +5,7 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
+using System.Threading.Channels;
 using Google.Protobuf;
 using Planet.Protocol;
 
@@ -19,8 +20,14 @@ public sealed class GameHost(World world, X509Certificate2 certificate, int port
     private static int ValidateLimit(int value)=>value is >=1 and <=4096?value:throw new ArgumentOutOfRangeException(nameof(value));
     public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
     public void Start() => listener.Start();
+    // Fixed simulation/broadcast period. 100 ms matches the old client polling rate.
+    public static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(100);
+    // Frames waiting for one client. A client that falls this far behind is disconnected
+    // rather than letting server memory grow without bound.
+    public const int OutboxCapacity = 64;
     public async Task Run()
     {
+        var ticking = world.RunTicker(TickInterval, shutdown.Token);
         while (!shutdown.IsCancellationRequested)
         {
             TcpClient client;
@@ -30,26 +37,42 @@ public sealed class GameHost(World world, X509Certificate2 certificate, int port
             clients.RemoveAll(t => t.IsCompleted);
             clients.Add(Serve(client));
         }
+        await ticking;
     }
+    // One connection = one reader loop (this method) + one writer loop.
+    // Only the writer touches SslStream.Write, so replies and tick pushes never interleave bytes.
     private async Task Serve(TcpClient client)
     {
         var session = new Session();
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(shutdown.Token);
+        var outbox = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(OutboxCapacity) { SingleReader = true });
+        bool closing = false;
+        session.Deliver = frame =>
+        {
+            if (Volatile.Read(ref closing)) return false;
+            if (outbox.Writer.TryWrite(frame)) return true;
+            Log("slow_consumer", session.Name, $"outbox>{OutboxCapacity}");
+            try { lifetime.Cancel(); } catch (ObjectDisposedException) { }
+            return false;
+        };
+        Task writer = Task.CompletedTask;
         using (client)
         await using (var tls = new SslStream(client.GetStream(), false))
         {
             try
             {
                 client.NoDelay = true;
-                using var handshake = CancellationTokenSource.CreateLinkedTokenSource(shutdown.Token);
+                using var handshake = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
                 handshake.CancelAfter(TimeSpan.FromSeconds(5));
                 await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions {
                     ServerCertificate = certificate, EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
                 }, handshake.Token);
+                writer = WriteLoop(tls, outbox.Reader, lifetime);
                 long window = Environment.TickCount64;
                 int count = 0;
-                while (!shutdown.IsCancellationRequested)
+                while (!lifetime.IsCancellationRequested)
                 {
-                    using var deadline = CancellationTokenSource.CreateLinkedTokenSource(shutdown.Token);
+                    using var deadline = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
                     deadline.CancelAfter(TimeSpan.FromSeconds(10));
                     var bytes = await Framing.ReadAsync(tls, deadline.Token);
                     var time = Environment.TickCount64;
@@ -57,7 +80,7 @@ public sealed class GameHost(World world, X509Certificate2 certificate, int port
                     if (++count > 25) throw new InvalidDataException("Request rate exceeded");
                     var command = Command.Parser.ParseFrom(bytes);
                     var result = await world.Handle(session, command);
-                    await Framing.WriteAsync(tls, result.ToByteArray(), deadline.Token);
+                    if (!session.Deliver(result.ToByteArray())) break;
                 }
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -66,10 +89,31 @@ public sealed class GameHost(World world, X509Certificate2 certificate, int port
             }
             finally
             {
+                Volatile.Write(ref closing, true);
+                outbox.Writer.TryComplete();
+                try { lifetime.Cancel(); } catch (ObjectDisposedException) { }
+                try { await writer; } catch (Exception) { }
                 try { await world.Disconnect(session); }
                 catch (Exception ex) { Log("disconnect_save_failed", session.Name, ex.GetType().Name); }
                 slots.Release();
             }
+        }
+    }
+    private static async Task WriteLoop(SslStream tls, ChannelReader<byte[]> frames, CancellationTokenSource lifetime)
+    {
+        try
+        {
+            await foreach (var frame in frames.ReadAllAsync(lifetime.Token))
+            {
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+                deadline.CancelAfter(TimeSpan.FromSeconds(10));
+                await Framing.WriteAsync(tls, frame, deadline.Token);
+            }
+        }
+        finally
+        {
+            // A failed or stalled write ends the connection; the reader observes the cancellation.
+            try { lifetime.Cancel(); } catch (ObjectDisposedException) { }
         }
     }
     public static void Log(string kind, string? character, string? detail = null) =>

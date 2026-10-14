@@ -442,6 +442,68 @@ travelTime+=2;var returning=await TravelCommand("travel_begin","coast_meadow");a
 Check((await travelStorage.Load("transportTester"))!.RegionId=="coast","disconnect before commit restores departure region");
 transportTester=new Session();travelSeq=0;await TravelCommand("login");returning=await TravelCommand("travel_begin","coast_meadow");travelTime+=13;await TravelCommand("travel_commit",returning.Message);await travelWorld.Disconnect(transportTester);
 Check((await travelStorage.Load("transportTester"))!.RegionId=="meadow","disconnect after commit restores destination");
+// Server tick + push: state reaches subscribed clients without a request.
+var pushStore=new FileStore(Path.Combine(dir,"push"));
+await pushStore.Save(Account.Create("pushhunter","test-pass-123") with {X=2},null);
+double pushTime=500;var pushWorld=new World(pushStore,()=>pushTime);
+var watcher=new Session();var pushWalker=new Session();var pushHunter=new Session();var oldStyle=new Session();var stuck=new Session();
+var watcherFrames=new List<Update>();var oldFrames=new List<Update>();
+watcher.Deliver=frame=>{watcherFrames.Add(Update.Parser.ParseFrom(frame));return true;};
+oldStyle.Deliver=frame=>{oldFrames.Add(Update.Parser.ParseFrom(frame));return true;};
+stuck.Deliver=_=>false;pushHunter.Deliver=_=>true;
+ulong pushSeq=0;
+Task<Update> PushSend(Session s,string kind,string name,bool subscribe=false,float dx=0,string text="",int channel=0)=>pushWorld.Handle(s,new Command{Sequence=++pushSeq,Kind=kind,Name=name,Password="test-pass-123",SubscribeUpdates=subscribe,Dx=dx,ChatText=text,ChannelId=channel});
+await PushSend(watcher,"login","pushwatcher",subscribe:true);
+await PushSend(pushWalker,"login","pushwalker");
+await PushSend(oldStyle,"login","pushold");
+await PushSend(stuck,"login","pushstuck",subscribe:true);
+await PushSend(pushHunter,"login","pushhunter",subscribe:true);
+pushTime+=1;await PushSend(pushWalker,"move","pushwalker",dx:1);
+await pushWorld.TickOnce();
+var pushed=watcherFrames.Single();
+Check(pushed.Push&&pushed.Sequence==0&&pushed.Code=="tick","subscribed client receives a server push without sending a request");
+Check(Math.Abs(pushed.Players.Single(p=>p.Name=="pushwalker").X-.24f)<.00001,"push carries another player's accepted movement");
+Check(oldFrames.Count==0,"clients that did not opt in never receive unsolicited frames");
+Check(pushed.InWorld&&pushed.ChannelId==1&&pushed.SelfStats!=null&&pushed.Channels.Count==Regions.ChannelCount,"shared room bytes and personal bytes merge into one Update");
+var pushReply=await PushSend(watcher,"snapshot","pushwatcher");
+Check(pushReply.Players.SequenceEqual(pushed.Players)&&pushReply.Monsters.SequenceEqual(pushed.Monsters),"push and reply describe the same room state");
+Check(pushReply.Tick>pushed.Tick,"tick numbers increase across pushes and replies");
+for(int hit=0;hit<3;hit++){pushTime+=.5;await PushSend(pushHunter,"attack","pushhunter");}
+watcherFrames.Clear();pushTime+=3.1;await pushWorld.TickOnce();
+Check(watcherFrames.Single().Monster.Hp==3,"monster respawns on the server tick without any client request");
+pushTime+=2;await PushSend(pushWalker,"chat","pushwalker",text:"푸시 채팅");
+watcherFrames.Clear();await pushWorld.TickOnce();await pushWorld.TickOnce();
+Check(watcherFrames.Count==2&&watcherFrames[0].Chat.Count(c=>c.Text=="푸시 채팅")==1&&watcherFrames[1].Chat.Count==0,"room chat is pushed exactly once");
+pushTime+=2;await PushSend(pushWalker,"switch_channel","pushwalker",channel:2);
+watcherFrames.Clear();await pushWorld.TickOnce();
+Check(watcherFrames.Single().Players.All(p=>p.Name!="pushwalker"),"push is scoped to channel");
+await pushWorld.Disconnect(watcher);watcherFrames.Clear();await pushWorld.TickOnce();
+Check(watcherFrames.Count==0,"disconnected session receives no further pushes");
+await pushWorld.Disconnect(pushWalker);await pushWorld.Disconnect(oldStyle);await pushWorld.Disconnect(stuck);await pushWorld.Disconnect(pushHunter);
+// Real ticker over TLS: frames arrive while the client stays silent, and replies are still matched.
+using (var pushCert = GameHost.DevelopmentCertificate(Path.Combine(dir, "push-tls")))
+await using (var pushHost = new GameHost(new World(new FileStore(Path.Combine(dir, "push-network"))), pushCert, 0))
+{
+    pushHost.Start(); var pushRunning = pushHost.Run();
+    var pushPin = pushCert.GetCertHashString(HashAlgorithmName.SHA256);
+    using var pushClient = new TcpClient(); await pushClient.ConnectAsync("127.0.0.1", pushHost.Port);
+    using var pushTls = new SslStream(pushClient.GetStream(), false, (_, cert, _, _) => cert != null &&
+        Convert.ToHexString(SHA256.HashData(cert.GetRawCertData())) == pushPin);
+    await pushTls.AuthenticateAsClientAsync("localhost");
+    using var pushTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    await Framing.WriteAsync(pushTls, new Command { Sequence = 1, Kind = "login", Name = "livepush", Password = "test-pass-123", SubscribeUpdates = true }.ToByteArray(), pushTimeout.Token);
+    int pushes = 0; bool loginReply = false; var listen = System.Diagnostics.Stopwatch.StartNew();
+    while (listen.ElapsedMilliseconds < 1000)
+    {
+        var frame = Update.Parser.ParseFrom(await Framing.ReadAsync(pushTls, pushTimeout.Token));
+        if (frame.Push) pushes++; else loginReply |= frame.Sequence == 1 && frame.Code == "ok";
+    }
+    Check(loginReply && pushes >= 5, $"live ticker pushes about every 100 ms over TLS ({pushes} in 1 s)");
+    await Framing.WriteAsync(pushTls, new Command { Sequence = 2, Kind = "snapshot" }.ToByteArray(), pushTimeout.Token);
+    Update matched;
+    do matched = Update.Parser.ParseFrom(await Framing.ReadAsync(pushTls, pushTimeout.Token)); while (matched.Push);
+    Check(matched.Sequence == 2, "reply is found among interleaved pushes by sequence");
+}
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore
