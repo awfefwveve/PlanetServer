@@ -20,3 +20,4 @@ UnityClient/Assets/Plugins/*.dll
 /data-editor/
 test-result.txt
 test-result.old
+build-result.txt
