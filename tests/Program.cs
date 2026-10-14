@@ -504,6 +504,76 @@ await using (var pushHost = new GameHost(new World(new FileStore(Path.Combine(di
     do matched = Update.Parser.ParseFrom(await Framing.ReadAsync(pushTls, pushTimeout.Token)); while (matched.Push);
     Check(matched.Sequence == 2, "reply is found among interleaved pushes by sequence");
 }
+// Monster AI, player damage, death penalty, revive, experience and level-up (server tick driven).
+var (fourLevels,gainedLevels)=CharacterStatsRules.GainExperience(new CharacterProgress(),500+1000+1500+5);
+Check(fourLevels.Level==4&&fourLevels.Experience==5&&gainedLevels==3&&fourLevels.Hp==CharacterStatsRules.MaxHp(4),"experience can cross several levels and level-up restores HP");
+Check(CharacterStatsRules.GainExperience(new CharacterProgress(100,0),long.MaxValue/2).Progress.Level==100,"level is capped");
+var fightStore=new FaultStore(new FileStore(Path.Combine(dir,"fight")));
+await fightStore.Save(Account.Create("fighter","test-pass-123") with {X=2},null);
+await fightStore.Save(Account.Create("fragile","test-pass-123") with {X=2,Progress=new CharacterProgress(1,100,10,60)},null);
+await fightStore.Save(Account.Create("almost","test-pass-123") with {X=2,Progress=new CharacterProgress(1,490,200,60)},null);
+await fightStore.Save(Account.Create("veteran","test-pass-123") with {X=2,Progress=new CharacterProgress(4,0,335,75)},null);
+double fightTime=2000;ulong fightSeq=0;
+var fightFrames=new List<Update>();
+Task<Update> Fight(World w,Session s,string name,string kind,string target="",float dx=0)=>w.Handle(s,new Command{Sequence=++fightSeq,Kind=kind,Name=name,Password="test-pass-123",TargetId=target,Dx=dx,SubscribeUpdates=true});
+async Task Ticks(World w,double seconds){for(double t=0;t<seconds-1e-9;t+=.1){fightTime+=.1;await w.TickOnce();}}
+var fightWorld=new World(fightStore,()=>fightTime);var fighter=new Session{Deliver=f=>{fightFrames.Add(Update.Parser.ParseFrom(f));return true;}};
+var fightStart=await Fight(fightWorld,fighter,"fighter","login");
+var slime=fightStart.Monsters.Single(m=>m.X==3&&m.Z==0);
+await Ticks(fightWorld,1);
+Check((await Fight(fightWorld,fighter,"fighter","snapshot")).Monsters.Single(m=>m.Id==slime.Id).State=="idle","passive monster ignores a nearby player");
+fightTime+=1;await Fight(fightWorld,fighter,"fighter","attack",slime.Id);
+var provoked=(await Fight(fightWorld,fighter,"fighter","snapshot")).Monsters.Single(m=>m.Id==slime.Id);
+Check(provoked.State=="chase"&&provoked.Target=="fighter"&&provoked.Hp==2,"being hit makes the monster fight back");
+fightFrames.Clear();await Ticks(fightWorld,2);
+var hurt=await Fight(fightWorld,fighter,"fighter","snapshot");
+Check(hurt.SelfStats.Hp==275-12,"monster attack lands once per interval after a wind-up");
+Check(fightFrames.SelectMany(f=>f.Events).Count(e=>e.Kind=="player_hit"&&e.Target=="fighter"&&e.Amount==12)==1,"damage event pushed once to the room");
+Check(hurt.Players.Single().Hp==263&&hurt.Players.Single().MaxHp==275,"other players can see HP through PlayerView");
+for(int step=0;step<60;step++){fightTime+=.1;await Fight(fightWorld,fighter,"fighter","move",dx:-1);await fightWorld.TickOnce();}
+var escaped=await Fight(fightWorld,fighter,"fighter","snapshot");
+var chaser=escaped.Monsters.Single(m=>m.Id==slime.Id);
+Check(chaser.State!="chase"&&chaser.Target=="","monster gives up beyond its leash");
+int beforeRegen=escaped.SelfStats.Hp;
+await Ticks(fightWorld,10);
+var settled=await Fight(fightWorld,fighter,"fighter","snapshot");
+var home=settled.Monsters.Single(m=>m.Id==slime.Id);
+Check(home.State=="idle"&&home.X==3&&home.Z==0&&home.Hp==3,"returning monster resets at home with full HP");
+Check(settled.SelfStats.Hp>beforeRegen&&settled.SelfStats.Hp<=275,"HP regenerates on the tick after combat ends");
+await fightWorld.Disconnect(fighter);
+var fragile=new Session();var fragileStart=await Fight(fightWorld,fragile,"fragile","login");
+var fragileSlime=fragileStart.Monsters.Single(m=>m.X==3&&m.Z==0);
+fightTime+=1;await Fight(fightWorld,fragile,"fragile","attack",fragileSlime.Id);
+await Ticks(fightWorld,1);
+var fallen=await Fight(fightWorld,fragile,"fragile","snapshot");
+Check(fallen.SelfStats.Hp==0&&fallen.Players.Single().Dead,"lethal monster damage kills the player");
+Check(fallen.SelfStats.Experience==100-25,"death costs five percent of the level requirement");
+Check(fallen.Monsters.Single(m=>m.Id==fragileSlime.Id).State!="chase","monsters stop chasing a dead player");
+fightTime+=1;
+Check((await Fight(fightWorld,fragile,"fragile","move",dx:1)).Code=="dead"&&(await Fight(fightWorld,fragile,"fragile","attack",fragileSlime.Id)).Code=="dead","dead players cannot move or attack");
+fightStore.Fail=true;
+Check((await Fight(fightWorld,fragile,"fragile","revive")).Code=="save_failed","failed revive save keeps the player dead");
+fightStore.Fail=false;
+var revived=await Fight(fightWorld,fragile,"fragile","revive");
+Check(revived.Code=="ok"&&revived.SelfStats.Hp==137&&revived.Players.Single().X==0,"revive restores half HP at the safe point");
+Check((await fightStore.Load("fragile"))!.Progress!.Hp==137,"revive is persisted");
+Check((await Fight(fightWorld,fragile,"fragile","revive")).Code=="not_dead","revive requires being dead");
+await Ticks(fightWorld,5); // let the provoked slime walk home and reset
+await fightWorld.Disconnect(fragile);
+var almost=new Session();var almostStart=await Fight(fightWorld,almost,"almost","login");
+var almostSlime=almostStart.Monsters.Single(m=>m.SpawnZone=="practice");Update levelled=null!;
+for(int hit=0;hit<3;hit++){fightTime+=.5;levelled=await Fight(fightWorld,almost,"almost","attack",almostSlime.Id);}
+Check(levelled.SelfStats.Level==2&&levelled.SelfStats.Experience==30&&levelled.SelfStats.Hp==levelled.SelfStats.MaxHp,"kill experience levels up and refills HP");
+Check((await fightStore.Load("almost"))!.Progress!.Level==2,"level-up is saved together with the kill");
+await fightWorld.Disconnect(almost);
+fightTime+=4; // practice slime respawns after the previous kill
+var veteran=new Session();var veteranStart=await Fight(fightWorld,veteran,"veteran","login");
+Check(veteranStart.SelfStats.Attack==2,"attack grows with level");
+var veteranSlime=veteranStart.Monsters.Single(m=>m.SpawnZone=="practice");
+fightTime+=1;var vHit=await Fight(fightWorld,veteran,"veteran","attack",veteranSlime.Id);
+fightTime+=1;var vKill=await Fight(fightWorld,veteran,"veteran","attack",veteranSlime.Id);
+Check(vHit.Monsters.Single(m=>m.Id==veteranSlime.Id).Hp==1&&vKill.Monsters.Single(m=>m.Id==veteranSlime.Id).Hp==0,"higher attack kills in fewer hits");
+await fightWorld.Disconnect(veteran);
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore

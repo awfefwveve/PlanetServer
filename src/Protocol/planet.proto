@@ -17,7 +17,7 @@ message Command {
   string realm_id = 11;
   string portal_id = 12;
   int32 channel_id = 13;
-  string chat_text = 14;
+  string chat_text = 14; // kinds also include: chat, portal, switch_channel, revive
   int64 chat_after = 15;
   string target_id = 16;
   // Login only. true = this client also accepts server-initiated Update frames
@@ -56,6 +56,10 @@ message PlayerView {
   string character_id = 8;
   string display_name = 9;
   Appearance appearance = 10;
+  int32 hp = 11;
+  int32 max_hp = 12;
+  int32 level = 13;
+  bool dead = 14;
 }
 message MonsterView {
   float x = 1;
@@ -64,6 +68,18 @@ message MonsterView {
   int32 max_hp = 4;
   string id = 5;
   string spawn_zone = 6;
+  string state = 7;   // idle, chase, return, dead
+  string target = 8;  // account name being chased, empty otherwise
+}
+// Something that happened in a room since the previous tick. Presentation only:
+// authoritative values are always in players/monsters/self_stats.
+message CombatEvent {
+  string kind = 1;    // monster_hit, player_hit, player_died, level_up, revived
+  string source = 2;  // account name or monster id
+  string target = 3;
+  int32 amount = 4;
+  float x = 5;
+  float z = 6;
 }
 message ChannelView {
   int32 id = 1;
@@ -101,4 +117,5 @@ message Update {
   // true = produced by the server tick, not a reply. sequence is 0 and code is "tick".
   // Replies and pushes may arrive out of tick order; clients keep the highest tick.
   bool push = 16;
+  repeated CombatEvent events = 17;
 }

@@ -18,6 +18,9 @@ public sealed class Session
     public double LastAttack = double.NegativeInfinity;
     public int LoginAttempts;
     public double LastChat = double.NegativeInfinity;
+    // Combat bookkeeping used by the tick: regeneration waits after the last hit.
+    public double LastHurt = double.NegativeInfinity;
+    public double RegenCarry;
     public long ChatAfter;
     // Set at login from Command.subscribe_updates. Only subscribed sessions receive tick pushes.
     public bool Subscribed;
@@ -39,7 +42,14 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
     private readonly ConcurrentDictionary<string, CharacterData> players = new();
     private readonly CharacterCatalog catalog=new(store);
     private readonly Func<double> now = clock ?? (() => (double)Stopwatch.GetTimestamp() / Stopwatch.Frequency);
-    private sealed class Room(int channel,string region) {public readonly MonsterPopulation Monsters=new(channel,region);public readonly RoomChat Chat=new();}
+    private sealed class Room(int channel,string region) {
+        public readonly MonsterPopulation Monsters=new(channel,region);public readonly RoomChat Chat=new();
+        // Combat events since the last push. Bounded so a room nobody watches cannot grow it.
+        private readonly List<CombatEvent> events=[];
+        public double LastTick=double.NaN;
+        public void Event(CombatEvent e){events.Add(e);if(events.Count>64)events.RemoveAt(0);}
+        public CombatEvent[] TakeEvents(){var taken=events.ToArray();events.Clear();return taken;}
+    }
     private readonly ConcurrentDictionary<string,Room> rooms=new();
     private readonly ConcurrentDictionary<string,int> channels=new();
     private Room GetRoom(int channel,string region){string key=channel+":"+region;if(!rooms.TryGetValue(key,out var room)){room=rooms.GetOrAdd(key,_=>new Room(channel,region));}room.Monsters.Refresh(now());return room;}
@@ -83,6 +93,9 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             if(command.Kind=="snapshot")return Snapshot(session,command.Sequence,"ok");
             if(!players.TryGetValue(name,out var current))return Snapshot(session,command.Sequence,"not_in_world");
             var room=GetRoom(session.Channel,current.RegionId);
+            // A dead character can talk, look, leave or revive; nothing that acts on the world.
+            if(CharacterStatsRules.IsDead(current.Progress)&&command.Kind is "move" or "attack" or "portal" or "travel_begin" or "switch_channel" or "claim")
+                return Snapshot(session,command.Sequence,"dead");
             switch(command.Kind) {
                 case "chat":
                     if(!RoomChat.Valid(command.ChatText)){code="invalid_chat";break;}
@@ -142,10 +155,25 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
                     var target=string.IsNullOrEmpty(command.TargetId)?room.Monsters.Primary:room.Monsters.Find(command.TargetId);
                     if(target is null||target.Hp==0){code="no_target";break;}
                     if((current.X-target.X)*(current.X-target.X)+(current.Z-target.Z)*(current.Z-target.Z)>2.25f){code="out_of_range";break;}
-                    if(target.Hp>1){target.Damage();break;}
-                    var reward=current with {Kills=current.Kills+1,Shards=current.Shards+1};
+                    int damage=CharacterStatsRules.Attack(CharacterStatsRules.Normalize(current.Progress).Level);
+                    var hit=new CombatEvent{Kind="monster_hit",Source=name,Target=target.Id,Amount=Math.Min(damage,target.Hp),X=target.X,Z=target.Z};
+                    if(!target.WouldDie(damage)){target.Damage(damage,name,time);room.Event(hit);break;}
+                    // Lethal: persist kill, shard and experience first; only then is the monster dead.
+                    var (progress,levels)=CharacterStatsRules.GainExperience(current.Progress,target.Kind.Experience);
+                    var reward=current with {Kills=current.Kills+1,Shards=current.Shards+1,Progress=progress};
                     await SaveProgress(name,reward);
-                    players[name]=reward;target.CommitDeath(now());message="Slime defeated. +1 shard. Progress saved.";
+                    players[name]=reward;target.CommitDeath(now());room.Event(hit);
+                    message=$"Slime defeated. +1 shard. +{target.Kind.Experience} EXP. Progress saved.";
+                    if(levels>0)room.Event(new CombatEvent{Kind="level_up",Source=name,Target=name,Amount=progress.Level,X=current.X,Z=current.Z});
+                    break;
+                case "revive":
+                    if(!CharacterStatsRules.IsDead(current.Progress)){code="not_dead";break;}
+                    // Back to the region's safe point with half HP. Saved so a reconnect cannot skip it.
+                    var revived=current with {X=0,Z=0,Progress=CharacterStatsRules.Revive(current.Progress)};
+                    try {await SaveProgress(name,revived);}
+                    catch(Exception e) when(e is IOException or InvalidOperationException or Npgsql.NpgsqlException){code="save_failed";break;}
+                    players[name]=revived;session.LastHurt=time;session.LastMove=time;
+                    room.Event(new CombatEvent{Kind="revived",Source=name,Target=name,X=0,Z=0});
                     break;
                 case "claim":
                     if(current.QuestClaimed){code="already_claimed";break;}
@@ -268,7 +296,9 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         result.Monsters.AddRange(room.Monsters.Snapshot());
         result.Players.AddRange(players.Where(p=>p.Value.RegionId==region&&channels.TryGetValue(p.Key,out var c)&&c==channel).OrderBy(p=>p.Key).Select(p=>new PlayerView {
             Name=p.Key,CharacterId=p.Value.Id,DisplayName=p.Value.Name,Appearance=p.Value.Look.ToProtocol(),X=p.Value.X,Z=p.Value.Z,
-            Kills=p.Value.Kills,Shards=p.Value.Shards,Gold=p.Value.Gold,QuestClaimed=p.Value.QuestClaimed
+            Kills=p.Value.Kills,Shards=p.Value.Shards,Gold=p.Value.Gold,QuestClaimed=p.Value.QuestClaimed,
+            Hp=CharacterStatsRules.Normalize(p.Value.Progress).Hp,MaxHp=CharacterStatsRules.MaxHp(CharacterStatsRules.Normalize(p.Value.Progress).Level),
+            Level=CharacterStatsRules.Normalize(p.Value.Progress).Level,Dead=CharacterStatsRules.IsDead(p.Value.Progress)
         }));
     }
 
@@ -301,35 +331,40 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
     private HashSet<int> ActiveChannels()
     {
         var active=new HashSet<int>();
-        foreach(var entry in online)if(entry.Value.Subscribed&&players.ContainsKey(entry.Key))active.Add(entry.Value.Channel);
+        foreach(var entry in online)if(players.ContainsKey(entry.Key))active.Add(entry.Value.Channel);
         return active;
     }
+
+    // Seconds without taking damage before natural regeneration starts, and its rate.
+    public const double RegenDelay=5, RegenPerSecond=.01;
 
     private async Task TickChannel(int channel)
     {
         await channelGates[channel].WaitAsync();
         try {
             // Membership is re-read under the gate: portal, channel switch and disconnect also hold it.
-            var members=new List<(Session Session,CharacterData Character)>();
+            var members=new List<(string Name,Session Session)>();
             foreach(var entry in online)
-                if(entry.Value.Subscribed&&entry.Value.Deliver!=null&&entry.Value.Channel==channel&&players.TryGetValue(entry.Key,out var character))
-                    members.Add((entry.Value,character));
+                if(entry.Value.Channel==channel&&players.ContainsKey(entry.Key))members.Add((entry.Key,entry.Value));
             if(members.Count==0)return;
             var channelViews=admission.Snapshot();
             var time=now();
-            foreach(var region in members.GroupBy(m=>m.Character.RegionId)) {
+            foreach(var region in members.GroupBy(m=>players[m.Name].RegionId)) {
                 var room=GetRoom(channel,region.Key);
-                room.Monsters.Refresh(time); // Respawn is now driven by time, not by someone asking.
+                Simulate(room,region.Key,region.ToList(),time);
+                var subscribers=region.Where(m=>m.Session.Subscribed&&m.Session.Deliver!=null).ToList();
+                if(subscribers.Count==0)continue;
                 // Serialize the shared part ONCE per room. Protobuf defines concatenated encodings
                 // as a merge, so shared + personal bytes parse as one Update. This turns the
                 // per-tick cost from O(players x room size) into O(players + room size).
                 var shared=new Update{Push=true};
                 shared.Channels.AddRange(channelViews);
                 shared.Chat.AddRange(room.Chat.TakeUnpushed());
+                shared.Events.AddRange(room.TakeEvents());
                 AddRoomState(shared,room,channel,region.Key);
                 var sharedBytes=shared.ToByteArray();
                 long tickValue=Interlocked.Increment(ref tick);
-                foreach(var (session,_) in region) {
+                foreach(var (_,session) in subscribers) {
                     var personal=Personal(session,0,"tick","",tickValue).ToByteArray();
                     if(sharedBytes.Length+personal.Length>Framing.MaximumBytes){Interlocked.Increment(ref oversizedPushes);continue;}
                     var frame=new byte[sharedBytes.Length+personal.Length];
@@ -340,5 +375,43 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             }
         }
         finally {channelGates[channel].Release();}
+    }
+
+    // One simulation step for a room, under its channel gate: respawn, monster AI, damage to
+    // players, death, regeneration. HP changes stay in memory and are persisted with the next
+    // save of that character (kill, portal, revive, disconnect) — a deliberate write-behind.
+    private void Simulate(Room room,string region,List<(string Name,Session Session)> members,double time)
+    {
+        float dt=double.IsNaN(room.LastTick)?0:(float)Math.Clamp(time-room.LastTick,0,.5);
+        room.LastTick=time;
+        room.Monsters.Refresh(time); // Respawn is driven by time, not by someone asking.
+        var sessions=members.ToDictionary(m=>m.Name,m=>m.Session);
+        (float X,float Z)? Locate(string name)
+        {
+            if(!sessions.TryGetValue(name,out var s)||s.Travel!=null)return null;
+            if(!players.TryGetValue(name,out var c)||c.RegionId!=region||CharacterStatsRules.IsDead(c.Progress))return null;
+            return (c.X,c.Z);
+        }
+        foreach(var monster in room.Monsters.All) {
+            if(monster.State==MonsterPopulation.Mode.Dead)continue;
+            int attack=monster.Step(time,dt,region,Locate);
+            if(attack==0||monster.Target is not string victimName)continue;
+            var victim=players[victimName];
+            int taken=CharacterStatsRules.DamageTaken(CharacterStatsRules.Normalize(victim.Progress).Level,attack);
+            var after=CharacterStatsRules.Hurt(victim.Progress,taken);
+            players[victimName]=victim with {Progress=after};sessions[victimName].LastHurt=time;
+            room.Event(new CombatEvent{Kind="player_hit",Source=monster.Id,Target=victimName,Amount=taken,X=victim.X,Z=victim.Z});
+            if(after.Hp>0)continue;
+            room.Event(new CombatEvent{Kind="player_died",Source=monster.Id,Target=victimName,X=victim.X,Z=victim.Z});
+            foreach(var other in room.Monsters.All)if(other.Target==victimName)other.LoseTarget();
+        }
+        foreach(var (name,session) in members) {
+            if(!players.TryGetValue(name,out var c)||c.RegionId!=region)continue;
+            var p=CharacterStatsRules.Normalize(c.Progress);int maxHp=CharacterStatsRules.MaxHp(p.Level);
+            if(p.Hp==0||p.Hp>=maxHp||time-session.LastHurt<RegenDelay){session.RegenCarry=0;continue;}
+            session.RegenCarry+=maxHp*RegenPerSecond*dt;
+            int whole=(int)session.RegenCarry;if(whole<1)continue;
+            session.RegenCarry-=whole;players[name]=c with {Progress=CharacterStatsRules.Heal(c.Progress,whole)};
+        }
     }
 }
