@@ -21,3 +21,4 @@ UnityClient/Assets/Plugins/*.dll
 test-result.txt
 test-result.old
 build-result.txt
+verify-result.txt
