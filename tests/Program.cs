@@ -574,6 +574,111 @@ fightTime+=1;var vHit=await Fight(fightWorld,veteran,"veteran","attack",veteranS
 fightTime+=1;var vKill=await Fight(fightWorld,veteran,"veteran","attack",veteranSlime.Id);
 Check(vHit.Monsters.Single(m=>m.Id==veteranSlime.Id).Hp==1&&vKill.Monsters.Single(m=>m.Id==veteranSlime.Id).Hp==0,"higher attack kills in fewer hits");
 await fightWorld.Disconnect(veteran);
+// Items, inventory, equipment and skills.
+Check(InventoryRules.Add(InventoryData.Empty(),[new ItemStack("potion_red",150)]).Inventory!.Slots.Count(s=>s!=null)==2,"stacks split at the item's maximum");
+Check(InventoryRules.Add(InventoryData.Empty(),[new ItemStack("no_such_item",1)]).Code=="unknown_item","unknown items are rejected");
+var fullBag=InventoryData.Empty() with {Slots=Enumerable.Repeat<ItemStack?>(new ItemStack("leaf_cap",1),ItemCatalog.BagCapacity).ToArray()};
+Check(InventoryRules.Add(fullBag,[new ItemStack("potion_red",1)]).Code=="bag_full","full bag refuses new items without partial changes");
+var itemStore=new FaultStore(new FileStore(Path.Combine(dir,"items")));
+double itemTime=5000;double nextRoll=.99;string itemCharId="";
+var itemWorld=new World(itemStore,()=>itemTime,roll:()=>nextRoll);
+var owner2=new Session();ulong itemSeq=0;
+Task<Update> Bag(string kind,int slot=0,int to=0,string skill="",string equip="")=>itemWorld.Handle(owner2,new Command{Sequence=++itemSeq,Kind=kind,Name="bagowner",Password="test-pass-123",LobbyLogin=true,Slot=slot,TargetSlot=to,SkillId=skill,EquipSlot=equip,DisplayName="가방주인",CharacterId=itemCharId,RealmId="meadow",Appearance=look});
+await Bag("login");itemCharId=(await Bag("create_character")).Characters.Single().Id;
+var kit=await Bag("enter_world");
+Check(kit.Inventory.Capacity==24&&kit.Inventory.Items.Any(i=>i.ItemId=="potion_red"&&i.Count==5)&&kit.Inventory.Items.Any(i=>i.ItemId=="twig_sword"),"new characters start with a server-granted kit");
+Check(kit.Skills.Single().Id=="pebble_strike"&&kit.Skills[0].Level==1&&kit.SkillPoints==0,"new characters know their first skill");
+int swordSlot=kit.Inventory.Items.Single(i=>i.ItemId=="twig_sword").Slot,potionSlot=kit.Inventory.Items.Single(i=>i.ItemId=="potion_red").Slot;
+var armed=await Bag("equip",swordSlot);
+Check(armed.Code=="ok"&&armed.SelfStats.Attack==2&&armed.Inventory.Equipped.Single().ItemId=="twig_sword"&&armed.Inventory.Items.All(i=>i.ItemId!="twig_sword"),"equipping moves the item out of the bag and raises attack");
+Check((await itemStore.Load("bagowner"))!.Characters![0].Inventory!.Equipped["weapon"]=="twig_sword","equipment is saved immediately");
+Check((await Bag("equip",potionSlot)).Code=="not_equipment","consumables cannot be equipped");
+Check((await Bag("use_item",swordSlot)).Code=="empty_slot","empty slots cannot be used");
+var movedBag=await Bag("move_item",potionSlot,10);
+Check(movedBag.Code=="ok"&&movedBag.Inventory.Items.Single(i=>i.ItemId=="potion_red").Slot==10,"items move between bag slots");
+Check((await Bag("move_item",10,99)).Code=="invalid_slot","moving outside the bag is rejected");
+var bare=await Bag("unequip",equip:"weapon");
+Check(bare.Code=="ok"&&bare.SelfStats.Attack==1&&bare.Inventory.Items.Any(i=>i.ItemId=="twig_sword"),"unequipping returns the item to the bag");
+Check((await Bag("unequip",equip:"weapon")).Code=="not_equipped","nothing to unequip is rejected");
+itemStore.Fail=true;
+Check((await Bag("discard_item",10)).Code=="save_failed","failed save keeps the item");
+itemStore.Fail=false;
+Check((await Bag("snapshot")).Inventory.Items.Single(i=>i.ItemId=="potion_red").Count==5,"inventory unchanged after a failed save");
+Check((await Bag("learn_skill",skill:"sprout_heal")).Code=="level_too_low","skills have level requirements");
+await itemWorld.Disconnect(owner2);
+itemWorld=new World(new FileStore(Path.Combine(dir,"items")),()=>itemTime,roll:()=>nextRoll);owner2=new Session();
+await Bag("login");var restored2=await Bag("enter_world");
+Check(restored2.Inventory.Items.Single(i=>i.ItemId=="potion_red").Slot==10&&restored2.Inventory.Items.Any(i=>i.ItemId=="twig_sword"),"inventory survives a fresh server instance");
+await itemWorld.Disconnect(owner2);
+
+var lootStore=new FaultStore(new FileStore(Path.Combine(dir,"loot")));
+await lootStore.Save(Account.Create("looter","test-pass-123") with {X=2,Progress=new CharacterProgress(1,0,200,60)},null);
+double lootTime=7000;double lootRoll=0;
+var lootWorld=new World(lootStore,()=>lootTime,roll:()=>lootRoll);var looter=new Session();ulong lootSeq=0;
+Task<Update> Loot(string kind,string target="",int slot=0)=>lootWorld.Handle(looter,new Command{Sequence=++lootSeq,Kind=kind,Name="looter",Password="test-pass-123",TargetId=target,Slot=slot});
+async Task<Update> KillPractice(){
+    var state=await Loot("snapshot");var id=state.Monsters.Single(m=>m.SpawnZone=="practice").Id;Update last=state;
+    for(int hit=0;hit<5&&last.Monsters.Single(m=>m.SpawnZone=="practice").Hp>0;hit++){lootTime+=.5;last=await Loot("attack",id);}
+    lootTime+=3.5;return last;
+}
+await Loot("login");
+lootStore.Fail=true;bool lootFailed=false;
+try{await KillPractice();}catch(IOException){lootFailed=true;}
+lootStore.Fail=false;
+Check(lootFailed&&(await Loot("snapshot")).Inventory.Items.Count==0,"failed kill save grants no drops");
+lootTime+=1;var looted=await KillPractice();
+Check(looted.Inventory.Items.Count==7&&looted.Inventory.Items.Any(i=>i.ItemId=="star_blade"),"every winning drop roll lands in the bag");
+Check((await lootStore.Load("looter"))!.Inventory!.Slots.Count(s=>s!=null)==7,"drops are saved in the same write as the kill");
+int bladeSlot=looted.Inventory.Items.Single(i=>i.ItemId=="star_blade").Slot;
+Check((await Loot("equip",slot:bladeSlot)).Code=="level_too_low","equipment level requirement enforced");
+var capped=await Loot("equip",slot:looted.Inventory.Items.Single(i=>i.ItemId=="leaf_cap").Slot);
+Check(capped.SelfStats.Defense==1,"armor raises defense");
+var redSlot=capped.Inventory.Items.Single(i=>i.ItemId=="potion_red").Slot;
+var drank=await Loot("use_item",slot:redSlot);
+Check(drank.Code=="ok"&&drank.SelfStats.Hp==275&&drank.Inventory.Items.All(i=>i.ItemId!="potion_red"),"potion heals and is consumed");
+Check((await Loot("use_item",slot:capped.Inventory.Items.Single(i=>i.ItemId=="potion_blue").Slot)).Code=="item_cooldown","item use has a short cooldown");
+lootTime+=1;var practice=(await Loot("snapshot")).Monsters.Single(m=>m.SpawnZone=="practice");
+await Loot("attack",practice.Id);
+for(int t=0;t<20;t++){lootTime+=.1;await lootWorld.TickOnce();}
+Check((await Loot("snapshot")).SelfStats.Hp==275-11,"equipped defense reduces monster damage");
+lootTime+=10;
+for(int kill=0;kill<5;kill++){lootTime+=1;await KillPractice();}
+var overflowState=await Loot("snapshot");
+Check(overflowState.Inventory.Items.Count==24,"bag fills up to its capacity");
+lootTime+=1;var overflowKill=await KillPractice();
+Check(overflowKill.Message.Contains("Bag full")&&overflowKill.Inventory.Items.Count==24,"drops that do not fit are reported and lost, never over-filled");
+await lootWorld.Disconnect(looter);
+
+var castStore=new FileStore(Path.Combine(dir,"cast"));
+await castStore.Save(Account.Create("caster","test-pass-123") with {X=2,Progress=new CharacterProgress(3,0,200,60),Skills=new SkillData(new(){{"pebble_strike",1}},2)},null);
+await castStore.Save(Account.Create("climber","test-pass-123") with {X=2,Progress=new CharacterProgress(1,490,275,60)},null);
+double castTime=9000;var castWorld=new World(castStore,()=>castTime,roll:()=>.99);var caster=new Session();ulong castSeq=0;
+Task<Update> Cast(string kind,string skill="",string target="",Session? who=null,string name="caster")=>castWorld.Handle(who??caster,new Command{Sequence=++castSeq,Kind=kind,Name=name,Password="test-pass-123",SkillId=skill,TargetId=target});
+var castStart=await Cast("login");var castSlime=castStart.Monsters.Single(m=>m.SpawnZone=="practice");
+Check((await Cast("skill","no_such_skill",castSlime.Id)).Code=="unknown_skill","unknown skill rejected");
+Check((await Cast("skill","petal_whirl")).Code=="not_learned","unlearned skill rejected");
+castTime+=1;var struck=await Cast("skill","pebble_strike",castSlime.Id);
+Check(struck.Code=="ok"&&struck.Monsters.Single(m=>m.Id==castSlime.Id).Hp==1&&struck.SelfStats.Mp==52,"single-target skill multiplies attack and spends MP");
+castTime+=1;
+Check((await Cast("skill","pebble_strike",castSlime.Id)).Code=="skill_cooldown","skill cooldown enforced");
+Check(struck.Skills.Single(s=>s.Id=="pebble_strike").CooldownRemaining>2,"cooldown remaining is sent to the client");
+var learnedWhirl=await Cast("learn_skill","petal_whirl");
+Check(learnedWhirl.Code=="ok"&&learnedWhirl.SkillPoints==1&&learnedWhirl.Skills.Any(s=>s.Id=="petal_whirl"),"skill points buy new skills");
+Check((await Cast("learn_skill","sprout_heal")).Code=="ok"&&(await Cast("learn_skill","sprout_heal")).Code=="no_skill_points","learning needs a point each time");
+Check((await castStore.Load("caster"))!.Skills!.Levels["sprout_heal"]==1,"learned skills are saved");
+castTime+=1;var whirled=await Cast("skill","petal_whirl");
+Check(whirled.Code=="ok"&&whirled.Players.Single().Kills==1&&whirled.Monsters.Single(m=>m.SpawnZone=="practice").Hp==0,"area skill can finish a monster and reward the kill");
+castTime+=1;var healedCast=await Cast("skill","sprout_heal");
+Check(healedCast.Code=="ok"&&healedCast.SelfStats.Hp==Math.Min(315,200+315*24/100),"self skill heals a share of max HP");
+int mpBefore=healedCast.SelfStats.Mp;
+for(int t=0;t<30;t++){castTime+=.1;await castWorld.TickOnce();}
+Check((await Cast("snapshot")).SelfStats.Mp>mpBefore,"MP regenerates on the tick");
+var climber=new Session();await Cast("login",who:climber,name:"climber");
+var climbSlime=(await Cast("snapshot",who:climber,name:"climber")).Monsters.Single(m=>m.SpawnZone=="practice");
+castTime+=4;climbSlime=(await Cast("snapshot",who:climber,name:"climber")).Monsters.Single(m=>m.SpawnZone=="practice");
+Update climbed=null!;for(int hit=0;hit<3;hit++){castTime+=.5;climbed=await Cast("attack",target:climbSlime.Id,who:climber,name:"climber");}
+Check(climbed.SelfStats.Level==2&&climbed.SkillPoints==1,"each level gained grants a skill point");
+await castWorld.Disconnect(caster);await castWorld.Disconnect(climber);
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore

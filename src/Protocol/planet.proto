@@ -24,6 +24,30 @@ message Command {
   // (push=true, sequence=0) between replies. Old clients omit it and keep
   // strict request/response framing.
   bool subscribe_updates = 17;
+  // Inventory and skills: use_item, equip, unequip, move_item, discard_item, skill, learn_skill.
+  int32 slot = 18;         // bag slot (use_item, equip, move_item from, discard_item)
+  int32 target_slot = 19;  // move_item destination
+  string skill_id = 20;    // skill, learn_skill (target_id carries the monster for single-target skills)
+  string equip_slot = 21;  // unequip: weapon, hat, body, shoes
+}
+message ItemStackView {
+  int32 slot = 1;
+  string item_id = 2;
+  int32 count = 3;
+}
+message EquipView {
+  string slot = 1;
+  string item_id = 2;
+}
+message Inventory {
+  int32 capacity = 1;
+  repeated ItemStackView items = 2;
+  repeated EquipView equipped = 3;
+}
+message SkillView {
+  string id = 1;
+  int32 level = 2;
+  float cooldown_remaining = 3;
 }
 message ChatMessage {
   int64 id = 1;
@@ -74,7 +98,7 @@ message MonsterView {
 // Something that happened in a room since the previous tick. Presentation only:
 // authoritative values are always in players/monsters/self_stats.
 message CombatEvent {
-  string kind = 1;    // monster_hit, player_hit, player_died, level_up, revived
+  string kind = 1;    // monster_hit, player_hit, player_died, level_up, revived, item_gained, skill_used, healed
   string source = 2;  // account name or monster id
   string target = 3;
   int32 amount = 4;
@@ -118,4 +142,7 @@ message Update {
   // Replies and pushes may arrive out of tick order; clients keep the highest tick.
   bool push = 16;
   repeated CombatEvent events = 17;
+  Inventory inventory = 18;       // own character only
+  repeated SkillView skills = 19; // learned skills, own character only
+  int32 skill_points = 20;
 }

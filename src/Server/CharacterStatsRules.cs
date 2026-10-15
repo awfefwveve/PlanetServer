@@ -17,11 +17,18 @@ public static class CharacterStatsRules {
         var p=saved??new CharacterProgress();int level=Math.Clamp(p.Level,1,MaxLevel);
         return new CharacterProgress(level,Math.Clamp(p.Experience,0,NextLevel(level)-1),Math.Clamp(p.Hp,0,MaxHp(level)),Math.Clamp(p.Mp,0,MaxMp(level)));
     }
-    public static CharacterStats View(CharacterProgress? saved){
+    // Totals include worn equipment. Level-only formulas stay above for clarity and tests.
+    public static int TotalAttack(CharacterProgress? saved,InventoryData? inventory)=>Attack(Normalize(saved).Level)+InventoryRules.AttackBonus(inventory);
+    public static int TotalDefense(CharacterProgress? saved,InventoryData? inventory)=>Defense(Normalize(saved).Level)+InventoryRules.DefenseBonus(inventory);
+    public static CharacterStats View(CharacterProgress? saved,InventoryData? inventory=null){
         var p=Normalize(saved);
         return new CharacterStats{Level=p.Level,Experience=p.Experience,NextLevelExperience=NextLevel(p.Level),
-            Hp=p.Hp,MaxHp=MaxHp(p.Level),Mp=p.Mp,MaxMp=MaxMp(p.Level),Attack=Attack(p.Level),Defense=Defense(p.Level)};
+            Hp=p.Hp,MaxHp=MaxHp(p.Level),Mp=p.Mp,MaxMp=MaxMp(p.Level),Attack=TotalAttack(p,inventory),Defense=TotalDefense(p,inventory)};
     }
+    public static CharacterProgress RestoreMp(CharacterProgress? saved,int amount){
+        var p=Normalize(saved);return p.Hp==0?p:p with {Mp=Math.Min(MaxMp(p.Level),p.Mp+amount)};
+    }
+    public static CharacterProgress SpendMp(CharacterProgress? saved,int amount)=>Normalize(saved) with {Mp=Math.Max(0,Normalize(saved).Mp-amount)};
     // Adds experience and applies every level-up it causes. Level-up restores HP/MP.
     public static (CharacterProgress Progress,int LevelsGained) GainExperience(CharacterProgress? saved,long amount){
         var p=Normalize(saved);long xp=p.Experience+Math.Max(0,amount);int level=p.Level,gained=0;
@@ -29,7 +36,7 @@ public static class CharacterStatsRules {
         if(level==MaxLevel)xp=Math.Min(xp,NextLevel(level)-1);
         return gained==0?(p with {Experience=xp},0):(new CharacterProgress(level,xp,MaxHp(level),MaxMp(level)),gained);
     }
-    public static int DamageTaken(int level,int monsterAttack)=>Math.Max(1,monsterAttack-Defense(level));
+    public static int DamageTaken(int defense,int monsterAttack)=>Math.Max(1,monsterAttack-defense);
     // Applies damage. Reaching 0 HP is death: a small experience penalty, no level loss.
     public static CharacterProgress Hurt(CharacterProgress? saved,int damage){
         var p=Normalize(saved);int hp=Math.Max(0,p.Hp-damage);

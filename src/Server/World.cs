@@ -20,7 +20,10 @@ public sealed class Session
     public double LastChat = double.NegativeInfinity;
     // Combat bookkeeping used by the tick: regeneration waits after the last hit.
     public double LastHurt = double.NegativeInfinity;
-    public double RegenCarry;
+    public double RegenCarry, MpCarry;
+    // Ready times for skills and item use. In memory only: a reconnect resets them, which is
+    // acceptable for short cooldowns and avoids a write per cast.
+    public readonly Dictionary<string,double> Cooldowns=new();
     public long ChatAfter;
     // Set at login from Command.subscribe_updates. Only subscribed sessions receive tick pushes.
     public bool Subscribed;
@@ -29,8 +32,10 @@ public sealed class Session
     public Func<byte[], bool>? Deliver;
 }
 
-public sealed class World(IStore store, Func<double>? clock = null, int channelCapacity=1000)
+public sealed class World(IStore store, Func<double>? clock = null, int channelCapacity=1000, Func<double>? roll = null)
 {
+    // Random source for drops. Injected in tests so loot is deterministic.
+    private readonly Func<double> random=roll??Random.Shared.NextDouble;
     // A bounded account stripe protects duplicate login across sessions. Channel ownership
     // serializes shared gameplay only within a channel; unrelated channels can progress.
     private readonly SemaphoreSlim[] accountGates=Enumerable.Range(0,256).Select(_=>new SemaphoreSlim(1,1)).ToArray();
@@ -94,7 +99,7 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             if(!players.TryGetValue(name,out var current))return Snapshot(session,command.Sequence,"not_in_world");
             var room=GetRoom(session.Channel,current.RegionId);
             // A dead character can talk, look, leave or revive; nothing that acts on the world.
-            if(CharacterStatsRules.IsDead(current.Progress)&&command.Kind is "move" or "attack" or "portal" or "travel_begin" or "switch_channel" or "claim")
+            if(CharacterStatsRules.IsDead(current.Progress)&&command.Kind is "move" or "attack" or "skill" or "use_item" or "portal" or "travel_begin" or "switch_channel" or "claim")
                 return Snapshot(session,command.Sequence,"dead");
             switch(command.Kind) {
                 case "chat":
@@ -155,17 +160,50 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
                     var target=string.IsNullOrEmpty(command.TargetId)?room.Monsters.Primary:room.Monsters.Find(command.TargetId);
                     if(target is null||target.Hp==0){code="no_target";break;}
                     if((current.X-target.X)*(current.X-target.X)+(current.Z-target.Z)*(current.Z-target.Z)>2.25f){code="out_of_range";break;}
-                    int damage=CharacterStatsRules.Attack(CharacterStatsRules.Normalize(current.Progress).Level);
-                    var hit=new CombatEvent{Kind="monster_hit",Source=name,Target=target.Id,Amount=Math.Min(damage,target.Hp),X=target.X,Z=target.Z};
-                    if(!target.WouldDie(damage)){target.Damage(damage,name,time);room.Event(hit);break;}
-                    // Lethal: persist kill, shard and experience first; only then is the monster dead.
-                    var (progress,levels)=CharacterStatsRules.GainExperience(current.Progress,target.Kind.Experience);
-                    var reward=current with {Kills=current.Kills+1,Shards=current.Shards+1,Progress=progress};
-                    await SaveProgress(name,reward);
-                    players[name]=reward;target.CommitDeath(now());room.Event(hit);
-                    message=$"Slime defeated. +1 shard. +{target.Kind.Experience} EXP. Progress saved.";
-                    if(levels>0)room.Event(new CombatEvent{Kind="level_up",Source=name,Target=name,Amount=progress.Level,X=current.X,Z=current.Z});
+                    message=await Strike(name,current,room,[(target,CharacterStatsRules.TotalAttack(current.Progress,current.Inventory))],time);
                     break;
+                case "skill":
+                    (code,message)=await CastSkill(session,name,current,room,command,time);
+                    break;
+                case "learn_skill": {
+                    var (learned,skills)=SkillRules.Learn(current.Skills,command.SkillId,CharacterStatsRules.Normalize(current.Progress).Level);
+                    code=learned=="ok"?await Commit(name,current with {Skills=skills}):learned;
+                    break;
+                }
+                case "use_item": {
+                    var bag=InventoryRules.Load(current.Inventory);
+                    var item=command.Slot>=0&&command.Slot<bag.Slots.Length&&bag.Slots[command.Slot] is {} stack?ItemCatalog.Find(stack.ItemId):null;
+                    if(item is null){code="empty_slot";break;}
+                    if(item.Kind!=ItemKind.Consumable){code="not_usable";break;}
+                    if(session.Cooldowns.TryGetValue("item",out var itemReady)&&time<itemReady){code="item_cooldown";break;}
+                    var (_,afterUse,_)=InventoryRules.TakeOne(bag,command.Slot);
+                    var healed=CharacterStatsRules.RestoreMp(CharacterStatsRules.Heal(current.Progress,item.HealHp),item.HealMp);
+                    code=await Commit(name,current with {Inventory=afterUse,Progress=healed});
+                    if(code!="ok")break;
+                    session.Cooldowns["item"]=time+.5;
+                    room.Event(new CombatEvent{Kind="healed",Source=item.Id,Target=name,Amount=item.HealHp>0?item.HealHp:item.HealMp,X=current.X,Z=current.Z});
+                    break;
+                }
+                case "equip": {
+                    var (equipped,inventory)=InventoryRules.Equip(InventoryRules.Load(current.Inventory),command.Slot,CharacterStatsRules.Normalize(current.Progress).Level);
+                    code=equipped=="ok"?await Commit(name,current with {Inventory=inventory}):equipped;
+                    break;
+                }
+                case "unequip": {
+                    var (removed,inventory)=InventoryRules.Unequip(InventoryRules.Load(current.Inventory),command.EquipSlot);
+                    code=removed=="ok"?await Commit(name,current with {Inventory=inventory}):removed;
+                    break;
+                }
+                case "move_item": {
+                    var (moved,inventory)=InventoryRules.Move(InventoryRules.Load(current.Inventory),command.Slot,command.TargetSlot);
+                    code=moved=="ok"?await Commit(name,current with {Inventory=inventory}):moved;
+                    break;
+                }
+                case "discard_item": {
+                    var (discarded,inventory)=InventoryRules.Discard(InventoryRules.Load(current.Inventory),command.Slot);
+                    code=discarded=="ok"?await Commit(name,current with {Inventory=inventory}):discarded;
+                    break;
+                }
                 case "revive":
                     if(!CharacterStatsRules.IsDead(current.Progress)){code="not_dead";break;}
                     // Back to the region's safe point with half HP. Saved so a reconnect cannot skip it.
@@ -246,10 +284,91 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         if(!command.LobbyLogin){players[name]=CharacterData.Legacy(account);legacyReservation!.Commit();}
         return Snapshot(session,command.Sequence,"ok");
     }
+    // Saves a changed character and publishes it. Inventory and skill changes are always
+    // persisted immediately: an item must never exist only in memory.
+    private async Task<string> Commit(string name,CharacterData updated)
+    {
+        try {await SaveProgress(name,updated);}
+        catch(Exception e) when(e is IOException or InvalidOperationException or Npgsql.NpgsqlException){return "save_failed";}
+        players[name]=updated;return "ok";
+    }
+
+    // One player action hitting one or more monsters. Non-lethal hits apply at once. All lethal
+    // hits are rewarded together (EXP, kills, drops, skill points) in ONE save; only after that
+    // save succeeds do those monsters die. A failed save leaves them alive and grants nothing.
+    private async Task<string> Strike(string name,CharacterData current,Room room,List<(MonsterPopulation.Monster Target,int Damage)> hits,double time)
+    {
+        var lethal=new List<MonsterPopulation.Monster>();
+        foreach(var (target,damage) in hits) {
+            if(target.WouldDie(damage)){lethal.Add(target);continue;}
+            target.Damage(damage,name,time);
+            room.Event(new CombatEvent{Kind="monster_hit",Source=name,Target=target.Id,Amount=damage,X=target.X,Z=target.Z});
+        }
+        if(lethal.Count==0){players[name]=current;return "";}
+        long experience=lethal.Sum(m=>m.Kind.Experience);
+        var (progress,levels)=CharacterStatsRules.GainExperience(current.Progress,experience);
+        var bag=InventoryRules.Load(current.Inventory);var gained=new List<ItemStack>();bool overflow=false;
+        foreach(var drop in lethal.SelectMany(_=>DropTables.Slime(random))) {
+            var (fit,next)=InventoryRules.Add(bag,[drop]);
+            if(next is null){overflow=true;continue;}
+            bag=next;gained.Add(drop);
+        }
+        var reward=current with {Kills=current.Kills+lethal.Count,Shards=current.Shards+lethal.Count,Progress=progress,Inventory=bag,
+            Skills=levels>0?SkillRules.GrantPoints(current.Skills,levels):current.Skills};
+        await SaveProgress(name,reward);
+        players[name]=reward;
+        foreach(var target in lethal) {
+            room.Event(new CombatEvent{Kind="monster_hit",Source=name,Target=target.Id,Amount=target.Hp,X=target.X,Z=target.Z});
+            target.CommitDeath(now());
+        }
+        foreach(var item in gained)room.Event(new CombatEvent{Kind="item_gained",Source=item.ItemId,Target=name,Amount=item.Count,X=current.X,Z=current.Z});
+        if(levels>0)room.Event(new CombatEvent{Kind="level_up",Source=name,Target=name,Amount=progress.Level,X=current.X,Z=current.Z});
+        return $"Slime defeated. +{lethal.Count} shard. +{experience} EXP."+(overflow?" Bag full: some drops were lost.":"")+" Progress saved.";
+    }
+
+    private async Task<(string Code,string Message)> CastSkill(Session session,string name,CharacterData current,Room room,Command command,double time)
+    {
+        var def=SkillCatalog.Find(command.SkillId);
+        if(def is null)return ("unknown_skill","");
+        int level=SkillRules.Load(current.Skills).Levels.GetValueOrDefault(def.Id);
+        if(level==0)return ("not_learned","");
+        if(session.Cooldowns.TryGetValue(def.Id,out var ready)&&time<ready)return ("skill_cooldown","");
+        if(time-session.LastAttack<.4)return ("cooldown","");
+        if(CharacterStatsRules.Normalize(current.Progress).Mp<def.MpCost)return ("no_mp","");
+        int attack=CharacterStatsRules.TotalAttack(current.Progress,current.Inventory);
+        int Damage()=>Math.Max(1,attack*def.Power(level)/100);
+        var hits=new List<(MonsterPopulation.Monster,int)>();
+        switch(def.Target) {
+            case SkillTarget.Single: {
+                var target=room.Monsters.Find(command.TargetId);
+                if(target is null||target.Hp==0)return ("no_target","");
+                if(Distance(current,target)>def.Range)return ("out_of_range","");
+                hits.Add((target,Damage()));break;
+            }
+            case SkillTarget.Area:
+                foreach(var m in room.Monsters.All)if(m.Hp>0&&Distance(current,m)<=def.Range)hits.Add((m,Damage()));
+                if(hits.Count==0)return ("no_target","");
+                break;
+        }
+        // Checks passed: the cast happens. Cooldown and MP are spent even if a lethal save fails.
+        session.Cooldowns[def.Id]=time+def.Cooldown;session.LastAttack=time;
+        var caster=current with {Progress=CharacterStatsRules.SpendMp(current.Progress,def.MpCost)};
+        room.Event(new CombatEvent{Kind="skill_used",Source=name,Target=def.Id,Amount=level,X=current.X,Z=current.Z});
+        if(def.Target==SkillTarget.Self) {
+            int heal=CharacterStatsRules.MaxHp(CharacterStatsRules.Normalize(caster.Progress).Level)*def.Power(level)/100;
+            players[name]=caster with {Progress=CharacterStatsRules.Heal(caster.Progress,heal)};
+            room.Event(new CombatEvent{Kind="healed",Source=def.Id,Target=name,Amount=heal,X=current.X,Z=current.Z});
+            return ("ok","");
+        }
+        players[name]=caster;
+        return ("ok",await Strike(name,caster,room,hits,time));
+    }
+    private static float Distance(CharacterData c,MonsterPopulation.Monster m){float dx=c.X-m.X,dz=c.Z-m.Z;return MathF.Sqrt(dx*dx+dz*dz);}
+
     private async Task SaveProgress(string name,CharacterData character)
     {
         var account=accounts[name];Account saved;
-        if(character.Id=="legacy")saved=account with {X=character.X,Z=character.Z,Kills=character.Kills,Shards=character.Shards,Gold=character.Gold,QuestClaimed=character.QuestClaimed,RegionId=character.RegionId,Progress=character.Progress,Revision=account.Revision+1};
+        if(character.Id=="legacy")saved=account with {X=character.X,Z=character.Z,Kills=character.Kills,Shards=character.Shards,Gold=character.Gold,QuestClaimed=character.QuestClaimed,RegionId=character.RegionId,Progress=character.Progress,Inventory=character.Inventory,Skills=character.Skills,Revision=account.Revision+1};
         else saved=account with {Characters=account.Characters!.Select(c=>c.Id==character.Id?character:c).ToArray(),Revision=account.Revision+1};
         await store.Save(saved,account.Revision);accounts[name]=saved;
     }
@@ -285,7 +404,11 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         if(session.Name is null||!accounts.TryGetValue(session.Name,out var account))return result;
         if(session.LobbyLogin)result.Characters.AddRange((account.Characters??[]).Select(c=>c.ToProtocol()));
         if(!players.TryGetValue(session.Name,out var selected))return result;
-        result.SelfStats=CharacterStatsRules.View(selected.Progress);
+        result.SelfStats=CharacterStatsRules.View(selected.Progress,selected.Inventory);
+        result.Inventory=InventoryRules.View(selected.Inventory);
+        var learned=SkillRules.Load(selected.Skills);var at=now();result.SkillPoints=learned.Points;
+        foreach(var (id,level) in learned.Levels)
+            result.Skills.Add(new SkillView{Id=id,Level=level,CooldownRemaining=session.Cooldowns.TryGetValue(id,out var ready)?(float)Math.Max(0,ready-at):0});
         result.InWorld=true;result.SelectedCharacterId=selected.Id;result.RegionId=selected.RegionId;result.ChannelId=session.Channel;
         return result;
     }
@@ -336,7 +459,7 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
     }
 
     // Seconds without taking damage before natural regeneration starts, and its rate.
-    public const double RegenDelay=5, RegenPerSecond=.01;
+    public const double RegenDelay=5, RegenPerSecond=.01, MpRegenPerSecond=.02;
 
     private async Task TickChannel(int channel)
     {
@@ -397,7 +520,7 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             int attack=monster.Step(time,dt,region,Locate);
             if(attack==0||monster.Target is not string victimName)continue;
             var victim=players[victimName];
-            int taken=CharacterStatsRules.DamageTaken(CharacterStatsRules.Normalize(victim.Progress).Level,attack);
+            int taken=CharacterStatsRules.DamageTaken(CharacterStatsRules.TotalDefense(victim.Progress,victim.Inventory),attack);
             var after=CharacterStatsRules.Hurt(victim.Progress,taken);
             players[victimName]=victim with {Progress=after};sessions[victimName].LastHurt=time;
             room.Event(new CombatEvent{Kind="player_hit",Source=monster.Id,Target=victimName,Amount=taken,X=victim.X,Z=victim.Z});
@@ -407,7 +530,12 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         }
         foreach(var (name,session) in members) {
             if(!players.TryGetValue(name,out var c)||c.RegionId!=region)continue;
-            var p=CharacterStatsRules.Normalize(c.Progress);int maxHp=CharacterStatsRules.MaxHp(p.Level);
+            var p=CharacterStatsRules.Normalize(c.Progress);int maxHp=CharacterStatsRules.MaxHp(p.Level),maxMp=CharacterStatsRules.MaxMp(p.Level);
+            if(p.Hp>0&&p.Mp<maxMp) {
+                // MP always trickles back, even in combat, so skills stay usable.
+                session.MpCarry+=maxMp*MpRegenPerSecond*dt;int mp=(int)session.MpCarry;
+                if(mp>=1){session.MpCarry-=mp;c=c with {Progress=CharacterStatsRules.RestoreMp(c.Progress,mp)};p=CharacterStatsRules.Normalize(c.Progress);players[name]=c;}
+            }
             if(p.Hp==0||p.Hp>=maxHp||time-session.LastHurt<RegenDelay){session.RegenCarry=0;continue;}
             session.RegenCarry+=maxHp*RegenPerSecond*dt;
             int whole=(int)session.RegenCarry;if(whole<1)continue;

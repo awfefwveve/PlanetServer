@@ -5,7 +5,8 @@ using Npgsql;
 namespace Planet.Server;
 
 public sealed record Account(string Name, string Salt, string Hash, float X = 0, float Z = 0,
-    int Kills = 0, int Shards = 0, int Gold = 0, bool QuestClaimed = false, long Revision = 0, CharacterData[]? Characters = null, string RegionId = "meadow", CharacterProgress? Progress = null)
+    int Kills = 0, int Shards = 0, int Gold = 0, bool QuestClaimed = false, long Revision = 0, CharacterData[]? Characters = null, string RegionId = "meadow", CharacterProgress? Progress = null,
+    InventoryData? Inventory = null, SkillData? Skills = null)
 {
     public static Account Create(string name, string password)
     {
