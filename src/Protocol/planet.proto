@@ -29,6 +29,30 @@ message Command {
   int32 target_slot = 19;  // move_item destination
   string skill_id = 20;    // skill, learn_skill (target_id carries the monster for single-target skills)
   string equip_slot = 21;  // unequip: weapon, hat, body, shoes
+  // Shop and trade: shop_buy (target_id=item, count), shop_sell (slot, count),
+  // trade_request / trade_accept (target_id=player), trade_offer (slot, count, gold), trade_confirm, trade_cancel.
+  int32 count = 22;
+  int64 gold = 23;
+  // chat: "" (room), "party", "whisper" (target_id = character name).
+  // party_invite (target_id = account or character name), party_accept (target_id = inviter account),
+  // party_decline, party_leave, party_kick (target_id = member account).
+  string chat_scope = 24;
+}
+message TradeItemView {
+  int32 slot = 1;        // slot in the owner's bag
+  string item_id = 2;
+  int32 count = 3;
+}
+message TradeView {
+  string partner = 1;       // account name
+  string partner_name = 2;  // character display name
+  string state = 3;         // invited (I asked), incoming (they asked), open
+  repeated TradeItemView mine = 4;
+  repeated TradeItemView theirs = 5;
+  int64 my_gold = 6;
+  int64 their_gold = 7;
+  bool my_confirmed = 8;
+  bool their_confirmed = 9;
 }
 message ItemStackView {
   int32 slot = 1;
@@ -55,6 +79,23 @@ message ChatMessage {
   string text = 3;
   int32 channel_id = 4;
   string region_id = 5;
+  string scope = 6;   // room, party, whisper, system
+  string to = 7;      // whisper recipient (character name)
+}
+message PartyMemberView {
+  string name = 1;          // account name
+  string display_name = 2;
+  int32 level = 3;
+  int32 hp = 4;
+  int32 max_hp = 5;
+  int32 channel_id = 6;
+  string region_id = 7;
+  bool leader = 8;
+}
+message PartyView {
+  repeated PartyMemberView members = 1;
+  string invited_by = 2;        // account name of a pending invitation to me
+  string invited_by_name = 3;
 }
 message Appearance {
   string archetype = 1;
@@ -145,4 +186,6 @@ message Update {
   Inventory inventory = 18;       // own character only
   repeated SkillView skills = 19; // learned skills, own character only
   int32 skill_points = 20;
+  TradeView trade = 21;           // present while a trade invitation or window exists
+  PartyView party = 22;           // own party and pending invitation
 }

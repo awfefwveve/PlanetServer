@@ -24,6 +24,9 @@ public interface IStore
     Task<Account?> Load(string name);
     Task Save(Account account, long? expectedRevision);
     Task<bool> CharacterNameExists(string normalizedName);
+    // All-or-nothing save of several accounts (player trade). Every revision must still match,
+    // otherwise nothing is written.
+    Task SaveMany(IReadOnlyList<(Account Account, long? ExpectedRevision)> changes);
 }
 
 // Local development only: one server process, atomic replacement on the same volume.
@@ -57,6 +60,22 @@ public sealed class FileStore(string directory) : IStore
             file.Flush(true);
         }
         File.Move(temporary, path, true);
+    }
+    // Development store: checks every revision first, writes every temp file, then swaps them in.
+    // The swap of two files is not one atomic step; a crash exactly between the two renames can
+    // leave one side applied. PostgreSQL (below) is the store that guarantees all-or-nothing.
+    public async Task SaveMany(IReadOnlyList<(Account Account, long? ExpectedRevision)> changes)
+    {
+        Directory.CreateDirectory(directory);
+        foreach(var (account,expected) in changes)
+            if((await Load(account.Name))?.Revision != expected) throw new InvalidOperationException("Revision conflict");
+        var staged=new List<(string Temporary,string Path)>();
+        foreach(var (account,_) in changes) {
+            var path=Path.Combine(directory,account.Name+".json");var temporary=path+".tmp";
+            using(var file=new FileStream(temporary,FileMode.Create,FileAccess.Write,FileShare.None)){JsonSerializer.Serialize(file,account);file.Flush(true);}
+            staged.Add((temporary,path));
+        }
+        foreach(var (temporary,path) in staged)File.Move(temporary,path,true);
     }
 }
 
@@ -110,6 +129,21 @@ public sealed class PostgresStore(string connectionString) : IStore, IAsyncDispo
             reserve.CommandText="INSERT INTO planet_character_names(character_id,name_key,account_name) VALUES($1,$2,$3) ON CONFLICT(character_id) DO NOTHING";
             reserve.Parameters.AddWithValue(character.Id);reserve.Parameters.AddWithValue(CharacterCatalog.NameKey(character.Name));reserve.Parameters.AddWithValue(account.Name);
             await reserve.ExecuteNonQueryAsync();
+        }
+        await transaction.CommitAsync();
+    }
+    // One database transaction: every UPDATE must hit its expected revision or all roll back.
+    public async Task SaveMany(IReadOnlyList<(Account Account, long? ExpectedRevision)> changes)
+    {
+        await using var connection=await source.OpenConnectionAsync();
+        await using var transaction=await connection.BeginTransactionAsync();
+        foreach(var (account,expected) in changes) {
+            if(expected is null)throw new ArgumentException("SaveMany only updates existing accounts.");
+            await using var cmd=connection.CreateCommand();cmd.Transaction=transaction;
+            cmd.CommandText="UPDATE planet_accounts SET revision=$2,payload=$3::jsonb,updated_at=now() WHERE name=$1 AND revision=$4";
+            cmd.Parameters.AddWithValue(account.Name);cmd.Parameters.AddWithValue(account.Revision);
+            cmd.Parameters.AddWithValue(JsonSerializer.Serialize(account));cmd.Parameters.AddWithValue(expected.Value);
+            if(await cmd.ExecuteNonQueryAsync()!=1){await transaction.RollbackAsync();throw new InvalidOperationException("Revision conflict");}
         }
         await transaction.CommitAsync();
     }

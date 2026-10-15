@@ -24,6 +24,9 @@ public sealed class Session
     // Ready times for skills and item use. In memory only: a reconnect resets them, which is
     // acceptable for short cooldowns and avoids a write per cast.
     public readonly Dictionary<string,double> Cooldowns=new();
+    // Party and whisper messages addressed to this connection; drained into the next Update.
+    public readonly ConcurrentQueue<ChatMessage> Mail=new();
+    public void Post(ChatMessage message){Mail.Enqueue(message);while(Mail.Count>50)Mail.TryDequeue(out _);}
     public long ChatAfter;
     // Set at login from Command.subscribe_updates. Only subscribed sessions receive tick pushes.
     public bool Subscribed;
@@ -65,6 +68,41 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
     // 1 while a channel's tick is still running, so a stalled channel is skipped instead of queued.
     private readonly int[] tickRunning=new int[Regions.ChannelCount+1];
     private long oversizedPushes;
+    // Player trades. Both names map to the same Trade. Invitations map invitee -> inviter.
+    // Touched only under the channel gate shared by both players (they must stand in one room).
+    private sealed class Trade(string a,string b)
+    {
+        public readonly string A=a,B=b;
+        public readonly Dictionary<string,List<(int Slot,int Count)>> Items=new(){{a,[]},{b,[]}};
+        public readonly Dictionary<string,int> Gold=new(){{a,0},{b,0}};
+        public readonly Dictionary<string,bool> Confirmed=new(){{a,false},{b,false}};
+        public string Other(string name)=>name==A?B:A;
+        public void Unconfirm(){Confirmed[A]=false;Confirmed[B]=false;}
+    }
+    private readonly ConcurrentDictionary<string,Trade> trades=new();
+    // Parties span channels and regions, so they are guarded by their own short lock (no awaits inside).
+    public const int PartyLimit=4;
+    private sealed class Party { public string Leader=""; public readonly List<string> Members=[]; }
+    private readonly object partyGate=new();
+    private readonly Dictionary<string,Party> parties=new();       // member account -> party
+    private readonly Dictionary<string,string> partyInvites=new(); // invitee -> inviter
+    private string? ResolvePlayer(string text)
+    {
+        if(online.ContainsKey(text)&&players.ContainsKey(text))return text;
+        foreach(var p in players)if(online.ContainsKey(p.Key)&&string.Equals(p.Value.Name,text,StringComparison.OrdinalIgnoreCase))return p.Key;
+        return null;
+    }
+    private void LeaveParty(string name)
+    {
+        lock(partyGate) {
+            partyInvites.Remove(name);foreach(var k in partyInvites.Where(p=>p.Value==name).Select(p=>p.Key).ToList())partyInvites.Remove(k);
+            if(!parties.Remove(name,out var party))return;
+            party.Members.Remove(name);
+            if(party.Members.Count<=1){foreach(var m in party.Members)parties.Remove(m);party.Members.Clear();return;}
+            if(party.Leader==name)party.Leader=party.Members[0];
+        }
+    }
+    private readonly ConcurrentDictionary<string,string> invites=new();
     public long OversizedPushes=>Interlocked.Read(ref oversizedPushes);
 
     public async Task<Update> Handle(Session session, Command command)
@@ -101,12 +139,67 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             // A dead character can talk, look, leave or revive; nothing that acts on the world.
             if(CharacterStatsRules.IsDead(current.Progress)&&command.Kind is "move" or "attack" or "skill" or "use_item" or "portal" or "travel_begin" or "switch_channel" or "claim")
                 return Snapshot(session,command.Sequence,"dead");
+            if(trades.ContainsKey(name)&&command.Kind is "move_item" or "discard_item" or "use_item" or "equip" or "unequip" or "shop_buy" or "shop_sell"
+                or "portal" or "travel_begin" or "switch_channel")
+                return Snapshot(session,command.Sequence,"trading");
             switch(command.Kind) {
                 case "chat":
                     if(!RoomChat.Valid(command.ChatText)){code="invalid_chat";break;}
                     if(time-session.LastChat<1){code="chat_rate_limited";break;}
+                    if(command.ChatScope=="party") {
+                        List<string> members;lock(partyGate)members=parties.TryGetValue(name,out var party)?[..party.Members]:[];
+                        if(members.Count==0){code="no_party";break;}
+                        session.LastChat=time;var line=new ChatMessage{Id=Interlocked.Increment(ref chatId),Sender=current.Name,Text=command.ChatText.Trim(),Scope="party"};
+                        foreach(var m in members)if(online.TryGetValue(m,out var to))to.Post(line.Clone());
+                        break;
+                    }
+                    if(command.ChatScope=="whisper") {
+                        var whisperTo=ResolvePlayer(command.TargetId);
+                        if(whisperTo is null||whisperTo==name){code="no_such_player";break;}
+                        session.LastChat=time;var line=new ChatMessage{Id=Interlocked.Increment(ref chatId),Sender=current.Name,Text=command.ChatText.Trim(),Scope="whisper",To=players[whisperTo].Name};
+                        online[whisperTo].Post(line.Clone());session.Post(line.Clone());
+                        break;
+                    }
                     session.LastChat=time;
-                    room.Chat.Add(new ChatMessage{Id=Interlocked.Increment(ref chatId),Sender=current.Name,Text=command.ChatText.Trim(),ChannelId=session.Channel,RegionId=current.RegionId});
+                    room.Chat.Add(new ChatMessage{Id=Interlocked.Increment(ref chatId),Sender=current.Name,Text=command.ChatText.Trim(),ChannelId=session.Channel,RegionId=current.RegionId,Scope="room"});
+                    break;
+                case "party_invite": {
+                    var invitee=ResolvePlayer(command.TargetId);
+                    if(invitee is null||invitee==name){code="no_such_player";break;}
+                    lock(partyGate) {
+                        if(parties.ContainsKey(invitee)){code="already_in_party";break;}
+                        if(parties.TryGetValue(name,out var party)&&(party.Leader!=name)){code="not_leader";break;}
+                        if(party!=null&&party.Members.Count>=PartyLimit){code="party_full";break;}
+                        partyInvites[invitee]=name;
+                    }
+                    if(code=="ok")online[invitee].Post(new ChatMessage{Id=Interlocked.Increment(ref chatId),Sender=current.Name,Text=current.Name+" 님이 파티에 초대했어요.",Scope="system"});
+                    break;
+                }
+                case "party_accept":
+                    lock(partyGate) {
+                        if(!partyInvites.TryGetValue(name,out var inviter)||inviter!=command.TargetId){code="no_invite";break;}
+                        partyInvites.Remove(name);
+                        if(!online.ContainsKey(inviter)){code="no_such_player";break;}
+                        if(parties.ContainsKey(name)){code="already_in_party";break;}
+                        if(!parties.TryGetValue(inviter,out var party)){party=new Party{Leader=inviter};party.Members.Add(inviter);parties[inviter]=party;}
+                        if(party.Members.Count>=PartyLimit){code="party_full";break;}
+                        party.Members.Add(name);parties[name]=party;
+                    }
+                    break;
+                case "party_decline":
+                    lock(partyGate)if(!partyInvites.Remove(name))code="no_invite";
+                    break;
+                case "party_leave":
+                    lock(partyGate)if(!parties.ContainsKey(name)){code="no_party";break;}
+                    LeaveParty(name);
+                    break;
+                case "party_kick":
+                    lock(partyGate) {
+                        if(!parties.TryGetValue(name,out var party)){code="no_party";break;}
+                        if(party.Leader!=name){code="not_leader";break;}
+                        if(command.TargetId==name||!party.Members.Contains(command.TargetId)){code="not_member";break;}
+                    }
+                    if(code=="ok")LeaveParty(command.TargetId);
                     break;
                 case "move":
                     var move=MovementRules.Evaluate(current.X,current.Z,command.Dx,command.Dz,time-session.LastMove,current.RegionId);
@@ -213,6 +306,72 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
                     players[name]=revived;session.LastHurt=time;session.LastMove=time;
                     room.Event(new CombatEvent{Kind="revived",Source=name,Target=name,X=0,Z=0});
                     break;
+                case "shop_buy": {
+                    var item=ItemCatalog.Find(command.TargetId);int price=ShopCatalog.Price(command.TargetId);
+                    if(item is null||price==0){code="not_sold";break;}
+                    if(current.RegionId!=ShopCatalog.Region){code="no_shop";break;}
+                    if(command.Count<1||command.Count>item.MaxStack){code="invalid_count";break;}
+                    long cost=(long)price*command.Count;if(cost>current.Gold){code="not_enough_gold";break;}
+                    var (fit,bag)=InventoryRules.Add(InventoryRules.Load(current.Inventory),[new ItemStack(item.Id,command.Count)]);
+                    if(bag is null){code=fit;break;}
+                    code=await Commit(name,current with {Gold=current.Gold-(int)cost,Inventory=bag});
+                    break;
+                }
+                case "shop_sell": {
+                    if(current.RegionId!=ShopCatalog.Region){code="no_shop";break;}
+                    var bag=InventoryRules.Load(current.Inventory);
+                    if(command.Slot<0||command.Slot>=bag.Slots.Length||bag.Slots[command.Slot] is not {} stack){code="empty_slot";break;}
+                    if(command.Count<1||command.Count>stack.Count){code="invalid_count";break;}
+                    var item=ItemCatalog.Find(stack.ItemId)!;var slots=(ItemStack?[])bag.Slots.Clone();
+                    slots[command.Slot]=stack.Count==command.Count?null:stack with {Count=stack.Count-command.Count};
+                    code=await Commit(name,current with {Gold=current.Gold+item.SellPrice*command.Count,Inventory=bag with {Slots=slots}});
+                    break;
+                }
+                case "trade_request": {
+                    var partner=command.TargetId;
+                    if(partner==name||!online.ContainsKey(partner)||!players.TryGetValue(partner,out var other)){code="no_partner";break;}
+                    if(online[partner].Channel!=session.Channel||other.RegionId!=current.RegionId||MathF.Sqrt((other.X-current.X)*(other.X-current.X)+(other.Z-current.Z)*(other.Z-current.Z))>4){code="too_far";break;}
+                    if(trades.ContainsKey(name)||trades.ContainsKey(partner)){code="busy";break;}
+                    invites[partner]=name;
+                    room.Event(new CombatEvent{Kind="trade_invite",Source=name,Target=partner,X=current.X,Z=current.Z});
+                    break;
+                }
+                case "trade_accept": {
+                    var inviter=command.TargetId;
+                    if(!invites.TryGetValue(name,out var asked)||asked!=inviter){code="no_invite";break;}
+                    invites.TryRemove(name,out _);
+                    if(!online.TryGetValue(inviter,out var inviterSession)||inviterSession.Channel!=session.Channel||!players.TryGetValue(inviter,out var other)||other.RegionId!=current.RegionId){code="no_partner";break;}
+                    if(trades.ContainsKey(name)||trades.ContainsKey(inviter)){code="busy";break;}
+                    var trade=new Trade(inviter,name);trades[inviter]=trade;trades[name]=trade;
+                    break;
+                }
+                case "trade_offer": {
+                    if(!trades.TryGetValue(name,out var trade)){code="not_trading";break;}
+                    var bag=InventoryRules.Load(current.Inventory);var offer=trade.Items[name];
+                    if(command.Count>0) {
+                        if(command.Slot<0||command.Slot>=bag.Slots.Length||bag.Slots[command.Slot] is not {} stack){code="empty_slot";break;}
+                        if(command.Count>stack.Count){code="invalid_count";break;}
+                        offer.RemoveAll(o=>o.Slot==command.Slot);
+                        if(offer.Count>=8){code="offer_full";break;}
+                        offer.Add((command.Slot,command.Count));
+                    }
+                    else if(command.Count==0&&command.Slot>=0)offer.RemoveAll(o=>o.Slot==command.Slot);
+                    if(command.Gold<0||command.Gold>current.Gold){code="not_enough_gold";break;}
+                    trade.Gold[name]=(int)command.Gold;
+                    trade.Unconfirm(); // any change means both sides must look again
+                    break;
+                }
+                case "trade_confirm": {
+                    if(!trades.TryGetValue(name,out var trade)){code="not_trading";break;}
+                    trade.Confirmed[name]=true;
+                    if(trade.Confirmed[trade.A]&&trade.Confirmed[trade.B])code=await ExecuteTrade(trade,room,time);
+                    break;
+                }
+                case "trade_cancel":
+                    if(invites.TryGetValue(name,out _))invites.TryRemove(name,out _);
+                    foreach(var pair in invites)if(pair.Value==name)invites.TryRemove(pair.Key,out _);
+                    if(trades.TryGetValue(name,out var cancelled))EndTrade(cancelled,room,"trade_cancelled");
+                    break;
                 case "claim":
                     if(current.QuestClaimed){code="already_claimed";break;}
                     if(current.Kills<3){code="not_ready";break;}
@@ -313,9 +472,29 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             if(next is null){overflow=true;continue;}
             bag=next;gained.Add(drop);
         }
+        // Party members standing in the same room share the experience (+10% per extra member).
+        var sharers=PartyNearby(name,current);
+        if(sharers.Count>0) {
+            long share=experience*(100+10*sharers.Count)/100/(sharers.Count+1);
+            (progress,levels)=CharacterStatsRules.GainExperience(current.Progress,share);
+        }
         var reward=current with {Kills=current.Kills+lethal.Count,Shards=current.Shards+lethal.Count,Progress=progress,Inventory=bag,
             Skills=levels>0?SkillRules.GrantPoints(current.Skills,levels):current.Skills};
-        await SaveProgress(name,reward);
+        var partners=new List<(string Name,CharacterData Data,int Levels)>();
+        foreach(var m in sharers) {
+            var data=players[m];long share=experience*(100+10*sharers.Count)/100/(sharers.Count+1);
+            var (p,l)=CharacterStatsRules.GainExperience(data.Progress,share);
+            partners.Add((m,data with {Progress=p,Skills=l>0?SkillRules.GrantPoints(data.Skills,l):data.Skills},l));
+        }
+        if(partners.Count==0)await SaveProgress(name,reward);
+        else {
+            // Killer and every sharing member are written together: all gain, or nobody does.
+            var docs=new List<(Account,long?)>{(Document(name,reward),accounts[name].Revision)};
+            foreach(var (m,data,_) in partners)docs.Add((Document(m,data),accounts[m].Revision));
+            await store.SaveMany(docs);
+            accounts[name]=docs[0].Item1;for(int i=0;i<partners.Count;i++)accounts[partners[i].Name]=docs[i+1].Item1;
+            foreach(var (m,data,l) in partners){players[m]=data;if(l>0)room.Event(new CombatEvent{Kind="level_up",Source=m,Target=m,Amount=CharacterStatsRules.Normalize(data.Progress).Level,X=data.X,Z=data.Z});}
+        }
         players[name]=reward;
         foreach(var target in lethal) {
             room.Event(new CombatEvent{Kind="monster_hit",Source=name,Target=target.Id,Amount=target.Hp,X=target.X,Z=target.Z});
@@ -365,11 +544,87 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
     }
     private static float Distance(CharacterData c,MonsterPopulation.Monster m){float dx=c.X-m.X,dz=c.Z-m.Z;return MathF.Sqrt(dx*dx+dz*dz);}
 
+    private List<string> PartyNearby(string name,CharacterData self)
+    {
+        List<string> members;lock(partyGate)members=parties.TryGetValue(name,out var party)?[..party.Members]:[];
+        int channel=online.TryGetValue(name,out var s)?s.Channel:0;
+        return members.Where(m=>m!=name&&online.TryGetValue(m,out var ms)&&ms.Channel==channel&&ms.Travel==null&&players.TryGetValue(m,out var c)&&c.RegionId==self.RegionId&&!CharacterStatsRules.IsDead(c.Progress)).ToList();
+    }
+    private PartyView? PartyFor(string name)
+    {
+        lock(partyGate) {
+            var view=new PartyView();
+            if(partyInvites.TryGetValue(name,out var inviter)){view.InvitedBy=inviter;view.InvitedByName=players.TryGetValue(inviter,out var i)?i.Name:inviter;}
+            if(parties.TryGetValue(name,out var party))foreach(var m in party.Members) {
+                if(!players.TryGetValue(m,out var c))continue;var p=CharacterStatsRules.Normalize(c.Progress);
+                view.Members.Add(new PartyMemberView{Name=m,DisplayName=c.Name,Level=p.Level,Hp=p.Hp,MaxHp=CharacterStatsRules.MaxHp(p.Level),
+                    ChannelId=online.TryGetValue(m,out var ms)?ms.Channel:0,RegionId=c.RegionId,Leader=party.Leader==m});
+            }
+            return view.Members.Count==0&&view.InvitedBy==""?null:view;
+        }
+    }
+    private TradeView? TradeFor(string name,CharacterData self)
+    {
+        if(trades.TryGetValue(name,out var t)) {
+            string other=t.Other(name);var view=new TradeView{Partner=other,PartnerName=players.TryGetValue(other,out var o)?o.Name:other,State="open",
+                MyGold=t.Gold[name],TheirGold=t.Gold[other],MyConfirmed=t.Confirmed[name],TheirConfirmed=t.Confirmed[other]};
+            view.Mine.AddRange(Offered(name,t));view.Theirs.AddRange(Offered(other,t));return view;
+        }
+        if(invites.TryGetValue(name,out var inviter))return new TradeView{Partner=inviter,PartnerName=players.TryGetValue(inviter,out var i)?i.Name:inviter,State="incoming"};
+        foreach(var pair in invites)if(pair.Value==name)return new TradeView{Partner=pair.Key,PartnerName=players.TryGetValue(pair.Key,out var p)?p.Name:pair.Key,State="invited"};
+        return null;
+    }
+    private IEnumerable<TradeItemView> Offered(string owner,Trade t)
+    {
+        var bag=InventoryRules.Load(players.TryGetValue(owner,out var c)?c.Inventory:null);
+        foreach(var (slot,count) in t.Items[owner])if(bag.Slots[slot] is {} s)yield return new TradeItemView{Slot=slot,ItemId=s.ItemId,Count=count};
+    }
+    private void EndTrade(Trade t,Room room,string kind)
+    {
+        trades.TryRemove(t.A,out _);trades.TryRemove(t.B,out _);
+        room.Event(new CombatEvent{Kind=kind,Source=t.A,Target=t.B});
+    }
+    // Both players' new states are computed from the current server state, validated, and saved
+    // in ONE multi-account write. Any failure (bag full, gold changed, storage error) changes nothing.
+    private async Task<string> ExecuteTrade(Trade t,Room room,double time)
+    {
+        var a=players[t.A];var b=players[t.B];
+        (string Code,CharacterData? Result) Side(CharacterData self,string owner,CharacterData partner,string partnerName)
+        {
+            var bag=InventoryRules.Load(self.Inventory);var slots=(ItemStack?[])bag.Slots.Clone();var outgoing=new List<ItemStack>();
+            foreach(var (slot,count) in t.Items[owner]) {
+                if(slots[slot] is not {} s||s.Count<count)return ("items_changed",null);
+                slots[slot]=s.Count==count?null:s with {Count=s.Count-count};outgoing.Add(new(s.ItemId,count));
+            }
+            var incoming=new List<ItemStack>();var partnerBag=InventoryRules.Load(partner.Inventory);
+            foreach(var (slot,count) in t.Items[partnerName])if(partnerBag.Slots[slot] is {} s)incoming.Add(new(s.ItemId,count));
+            var (fit,next)=InventoryRules.Add(bag with {Slots=slots},incoming);
+            if(next is null)return (fit,null);
+            int gold=self.Gold-t.Gold[owner]+t.Gold[partnerName];
+            if(self.Gold<t.Gold[owner])return ("not_enough_gold",null);
+            return ("ok",self with {Inventory=next,Gold=gold});
+        }
+        var (codeA,newA)=Side(a,t.A,b,t.B);var (codeB,newB)=Side(b,t.B,a,t.A);
+        if(newA is null||newB is null){t.Unconfirm();return newA is null?codeA:codeB;}
+        var docA=Document(t.A,newA);var docB=Document(t.B,newB);
+        try {await store.SaveMany([(docA,accounts[t.A].Revision),(docB,accounts[t.B].Revision)]);}
+        catch(Exception e) when(e is IOException or InvalidOperationException or Npgsql.NpgsqlException){t.Unconfirm();return "save_failed";}
+        accounts[t.A]=docA;accounts[t.B]=docB;players[t.A]=newA;players[t.B]=newB;
+        EndTrade(t,room,"trade_done");
+        return "ok";
+    }
+    // The account document that results from saving one character.
+    private Account Document(string name,CharacterData character)
+    {
+        var account=accounts[name];
+        return character.Id=="legacy"
+            ? account with {X=character.X,Z=character.Z,Kills=character.Kills,Shards=character.Shards,Gold=character.Gold,QuestClaimed=character.QuestClaimed,RegionId=character.RegionId,Progress=character.Progress,Inventory=character.Inventory,Skills=character.Skills,Revision=account.Revision+1}
+            : account with {Characters=account.Characters!.Select(c=>c.Id==character.Id?character:c).ToArray(),Revision=account.Revision+1};
+    }
+
     private async Task SaveProgress(string name,CharacterData character)
     {
-        var account=accounts[name];Account saved;
-        if(character.Id=="legacy")saved=account with {X=character.X,Z=character.Z,Kills=character.Kills,Shards=character.Shards,Gold=character.Gold,QuestClaimed=character.QuestClaimed,RegionId=character.RegionId,Progress=character.Progress,Inventory=character.Inventory,Skills=character.Skills,Revision=account.Revision+1};
-        else saved=account with {Characters=account.Characters!.Select(c=>c.Id==character.Id?character:c).ToArray(),Revision=account.Revision+1};
+        var account=accounts[name];var saved=Document(name,character);
         await store.Save(saved,account.Revision);accounts[name]=saved;
     }
     public async Task Disconnect(Session session)
@@ -380,6 +635,9 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
             if(session.Name is null)return;var name=session.Name;
             try {if(players.TryGetValue(name,out var character))await SaveProgress(name,character);}
             finally {
+                if(trades.TryGetValue(name,out var open)){trades.TryRemove(open.A,out _);trades.TryRemove(open.B,out _);}
+                LeaveParty(name);
+                invites.TryRemove(name,out _);foreach(var pair in invites)if(pair.Value==name)invites.TryRemove(pair.Key,out _);
                 online.TryRemove(new KeyValuePair<string,Session>(name,session));
                 players.TryRemove(name,out _);accounts.TryRemove(name,out _);channels.TryRemove(name,out _);admission.Remove(name);session.Name=null;
             }
@@ -407,6 +665,9 @@ public sealed class World(IStore store, Func<double>? clock = null, int channelC
         result.SelfStats=CharacterStatsRules.View(selected.Progress,selected.Inventory);
         result.Inventory=InventoryRules.View(selected.Inventory);
         var learned=SkillRules.Load(selected.Skills);var at=now();result.SkillPoints=learned.Points;
+        result.Trade=TradeFor(session.Name,selected);
+        result.Party=PartyFor(session.Name);
+        while(session.Mail.TryDequeue(out var mail))result.Chat.Add(mail);
         foreach(var (id,level) in learned.Levels)
             result.Skills.Add(new SkillView{Id=id,Level=level,CooldownRemaining=session.Cooldowns.TryGetValue(id,out var ready)?(float)Math.Max(0,ready-at):0});
         result.InWorld=true;result.SelectedCharacterId=selected.Id;result.RegionId=selected.RegionId;result.ChannelId=session.Channel;

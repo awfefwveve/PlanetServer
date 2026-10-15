@@ -55,6 +55,16 @@ namespace Planet.Protocol
         public static ItemDefinition Find(string id) => id != null && items.TryGetValue(id, out var item) ? item : null;
     }
 
+    // NPC shop stock. Selling uses ItemDefinition.SellPrice.
+    public static class ShopCatalog
+    {
+        public static readonly string Region = "meadow";
+        private static readonly Dictionary<string, int> prices = new Dictionary<string, int>
+        { {"potion_red",20}, {"potion_blue",25}, {"twig_sword",50}, {"leaf_cap",60}, {"cloud_boots",80} };
+        public static IEnumerable<KeyValuePair<string, int>> Stock => prices;
+        public static int Price(string id) => id != null && prices.TryGetValue(id, out var price) ? price : 0;
+    }
+
     public enum SkillTarget { Single, Area, Self }
 
     public sealed class SkillDefinition

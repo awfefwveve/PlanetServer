@@ -679,6 +679,126 @@ castTime+=4;climbSlime=(await Cast("snapshot",who:climber,name:"climber")).Monst
 Update climbed=null!;for(int hit=0;hit<3;hit++){castTime+=.5;climbed=await Cast("attack",target:climbSlime.Id,who:climber,name:"climber");}
 Check(climbed.SelfStats.Level==2&&climbed.SkillPoints==1,"each level gained grants a skill point");
 await castWorld.Disconnect(caster);await castWorld.Disconnect(climber);
+// NPC shop and player-to-player trade (two accounts saved in one write).
+var shopStore=new FaultStore(new FileStore(Path.Combine(dir,"shop")));
+await shopStore.Save(Account.Create("buyer","test-pass-123") with {Gold=100,Inventory=InventoryData.Empty()},null);
+double shopTime=11000;var shopWorld=new World(shopStore,()=>shopTime);var buyer=new Session();ulong shopSeq=0;
+Task<Update> Shop(string kind,string item="",int slot=0,int count=1)=>shopWorld.Handle(buyer,new Command{Sequence=++shopSeq,Kind=kind,Name="buyer",Password="test-pass-123",TargetId=item,Slot=slot,Count=count});
+await Shop("login");
+var bought=await Shop("shop_buy","potion_red",count:3);
+Check(bought.Code=="ok"&&bought.Players.Single().Gold==40&&bought.Inventory.Items.Single().Count==3,"shop sells for gold and fills the bag");
+Check((await Shop("shop_buy","twig_sword")).Code=="not_enough_gold","shop refuses when gold is short");
+Check((await Shop("shop_buy","slime_jelly")).Code=="not_sold","items not in stock cannot be bought");
+Check((await Shop("shop_buy","potion_red",count:0)).Code=="invalid_count","invalid count rejected");
+shopStore.Fail=true;
+Check((await Shop("shop_buy","potion_red")).Code=="save_failed"&&(await Shop("snapshot")).Players.Single().Gold==40,"failed purchase save keeps gold");
+shopStore.Fail=false;
+var sold=await Shop("shop_sell",slot:0,count:2);
+Check(sold.Code=="ok"&&sold.Players.Single().Gold==50&&sold.Inventory.Items.Single().Count==1,"selling returns the sell price");
+Check((await Shop("shop_sell",slot:0,count:5)).Code=="invalid_count","cannot sell more than owned");
+Check((await shopStore.Load("buyer"))!.Gold==50,"shop results are saved");
+await shopWorld.Disconnect(buyer);
+
+var tradeStore=new FaultStore(new FileStore(Path.Combine(dir,"trade")));
+var sellerBag=InventoryRules.Add(InventoryData.Empty(),[new ItemStack("star_blade",1),new ItemStack("potion_red",10)]).Inventory!;
+await tradeStore.Save(Account.Create("tradera","test-pass-123") with {X=0,Gold=500,Inventory=InventoryData.Empty()},null);
+await tradeStore.Save(Account.Create("traderb","test-pass-123") with {X=1,Gold=20,Inventory=sellerBag},null);
+await tradeStore.Save(Account.Create("farfriend","test-pass-123") with {X=12,Z=-4},null);
+double tradeTime=12000;var tradeWorld=new World(tradeStore,()=>tradeTime);
+var ta=new Session();var tb=new Session();var tc=new Session();ulong tradeSeq=0;
+Task<Update> T(Session s,string name,string kind,string target="",int slot=-1,int count=0,long gold=0)=>tradeWorld.Handle(s,new Command{Sequence=++tradeSeq,Kind=kind,Name=name,Password="test-pass-123",TargetId=target,Slot=slot,Count=count,Gold=gold});
+await T(ta,"tradera","login");await T(tb,"traderb","login");await T(tc,"farfriend","login");
+Check((await T(ta,"tradera","trade_request","farfriend")).Code=="too_far","trading needs the partner nearby");
+Check((await T(ta,"tradera","trade_request","tradera")).Code=="no_partner","cannot trade with yourself");
+await T(ta,"tradera","trade_request","traderb");
+var invited=await T(tb,"traderb","snapshot");
+Check(invited.Trade?.State=="incoming"&&invited.Trade.Partner=="tradera","invitee sees the request");
+Check((await T(tc,"farfriend","trade_accept","tradera")).Code=="no_invite","only the invited player can accept");
+var opened=await T(tb,"traderb","trade_accept","tradera");
+Check(opened.Code=="ok"&&opened.Trade.State=="open","accepting opens the trade for both");
+Check((await T(tb,"traderb","discard_item",slot:0)).Code=="trading","bag is locked while trading");
+await T(tb,"traderb","trade_offer",slot:0,count:1);
+await T(tb,"traderb","trade_offer",slot:1,count:4);
+await T(ta,"tradera","trade_offer",gold:300);
+Check((await T(ta,"tradera","trade_offer",gold:999)).Code=="not_enough_gold","cannot offer more gold than owned");
+await T(ta,"tradera","trade_offer",gold:300);
+var view=await T(ta,"tradera","snapshot");
+Check(view.Trade.Theirs.Count==2&&view.Trade.MyGold==300,"both sides see the offers");
+await T(ta,"tradera","trade_confirm");
+await T(tb,"traderb","trade_offer",slot:1,count:5);
+Check(!(await T(ta,"tradera","snapshot")).Trade.MyConfirmed,"changing an offer clears confirmations");
+await T(ta,"tradera","trade_confirm");
+tradeStore.Fail=true;
+var failedTrade=await T(tb,"traderb","trade_confirm");
+tradeStore.Fail=false;
+Check(failedTrade.Code=="save_failed","storage failure is reported");
+var diskA=await tradeStore.Load("tradera");var diskB=await tradeStore.Load("traderb");
+Check(diskA!.Gold==500&&diskB!.Gold==20&&diskB.Inventory!.Slots.Count(s=>s!=null)==2,"failed trade changes neither account");
+Check((await T(ta,"tradera","snapshot")).Inventory.Items.Count==0,"failed trade leaves memory untouched");
+await T(ta,"tradera","trade_confirm");
+var done=await T(tb,"traderb","trade_confirm");
+Check(done.Code=="ok"&&done.Trade==null,"trade completes when both confirm");
+var afterA=await T(ta,"tradera","snapshot");
+Check(afterA.Inventory.Items.Any(i=>i.ItemId=="star_blade")&&afterA.Inventory.Items.Single(i=>i.ItemId=="potion_red").Count==5&&afterA.Players.Single(p=>p.Name=="tradera").Gold==200,"buyer receives items and pays gold");
+Check(done.Inventory.Items.Single(i=>i.ItemId=="potion_red").Count==5&&done.Players.Single(p=>p.Name=="traderb").Gold==320,"seller receives gold and keeps the rest");
+diskA=await tradeStore.Load("tradera");diskB=await tradeStore.Load("traderb");
+Check(diskA!.Gold==200&&diskB!.Gold==320&&diskA.Inventory!.Slots.Any(s=>s?.ItemId=="star_blade")&&!diskB.Inventory!.Slots.Any(s=>s?.ItemId=="star_blade"),"both accounts saved together");
+Check(diskA.Inventory!.Slots.Sum(s=>s?.ItemId=="potion_red"?s.Count:0)+diskB.Inventory!.Slots.Sum(s=>s?.ItemId=="potion_red"?s.Count:0)==10,"no item is duplicated or lost");
+await T(ta,"tradera","trade_request","traderb");await T(tb,"traderb","trade_accept","tradera");
+await tradeWorld.Disconnect(tb);
+Check((await T(ta,"tradera","snapshot")).Trade==null,"partner disconnect closes the trade");
+Check((await T(ta,"tradera","discard_item",slot:0)).Code!="trading","bag unlocks after the trade closes");
+await tradeWorld.Disconnect(ta);await tradeWorld.Disconnect(tc);
+// Parties: invitations, shared experience saved atomically, party and whisper chat.
+var partyStore=new FaultStore(new FileStore(Path.Combine(dir,"party")));
+foreach(var (who,x,region) in new[]{("pleader",2f,"meadow"),("pmember",2.5f,"meadow"),("pfar",0f,"forest"),("poutsider",1f,"meadow"),("pfour",1f,"meadow"),("pfive",1f,"meadow")})
+    await partyStore.Save(Account.Create(who,"test-pass-123") with {X=x,RegionId=region},null);
+double partyTime=13000;var partyWorld=new World(partyStore,()=>partyTime,roll:()=>.99);ulong partySeq=0;
+var ps=new Dictionary<string,Session>();
+Task<Update> P(string who,string kind,string target="",string text="",string scope="")=>partyWorld.Handle(ps[who],new Command{Sequence=++partySeq,Kind=kind,Name=who,Password="test-pass-123",TargetId=target,ChatText=text,ChatScope=scope});
+foreach(var who in new[]{"pleader","pmember","pfar","poutsider","pfour","pfive"}){ps[who]=new Session();await P(who,"login");}
+Check((await P("pleader","party_invite","nobody")).Code=="no_such_player","inviting an unknown player is rejected");
+await P("pleader","party_invite","pmember");
+var partyInvite=await P("pmember","snapshot");
+Check(partyInvite.Party?.InvitedBy=="pleader"&&partyInvite.Chat.Any(c=>c.Scope=="system"),"invitee sees the invitation");
+Check((await P("poutsider","party_accept","pleader")).Code=="no_invite","only the invited player can join");
+var joined=await P("pmember","party_accept","pleader");
+Check(joined.Code=="ok"&&joined.Party.Members.Count==2&&joined.Party.Members.Single(m=>m.Leader).Name=="pleader","accepting forms a party with the inviter as leader");
+Check((await P("pmember","party_invite","poutsider")).Code=="not_leader","only the leader invites");
+await P("pleader","party_invite","pfar");await P("pfar","party_accept","pleader");
+var slimeId=(await P("pleader","snapshot")).Monsters.Single(m=>m.SpawnZone=="practice").Id;
+for(int hit=0;hit<2;hit++){partyTime+=.5;await P("pleader","attack",slimeId);}
+partyStore.Fail=true;bool partyFailed=false;partyTime+=.5;
+try{await P("pleader","attack",slimeId);}catch(IOException){partyFailed=true;}
+partyStore.Fail=false;
+var afterFail=await P("pmember","snapshot");
+Check(partyFailed&&afterFail.SelfStats.Experience==0&&afterFail.Monsters.Single(m=>m.Id==slimeId).Hp==1,"failed shared save gives nobody experience");
+partyTime+=.5;await P("pleader","attack",slimeId);
+var leaderAfter=await P("pleader","snapshot");var memberAfter=await P("pmember","snapshot");var farAfter=await P("pfar","snapshot");
+Check(leaderAfter.SelfStats.Experience==22&&memberAfter.SelfStats.Experience==22,"nearby party members split experience with a bonus");
+Check(farAfter.SelfStats.Experience==0,"members in another region get nothing");
+Check((await partyStore.Load("pmember"))!.Progress!.Experience==22&&(await partyStore.Load("pleader"))!.Progress!.Experience==22,"shared experience is saved for every member");
+partyTime+=2;await P("pleader","chat",text:"파티 안녕",scope:"party");
+Check((await P("pfar","snapshot")).Chat.Any(c=>c.Scope=="party"&&c.Text=="파티 안녕"),"party chat reaches members in other regions");
+Check(!(await P("poutsider","snapshot")).Chat.Any(c=>c.Scope=="party"),"outsiders do not receive party chat");
+partyTime+=2;var whisperReply=await P("pmember","chat","pfar","귓속말이야",scope:"whisper");
+var whispered=await P("pfar","snapshot");
+Check(whispered.Chat.Single(c=>c.Scope=="whisper").Sender=="pmember","whisper reaches the named player");
+Check(whisperReply.Chat.Any(c=>c.Scope=="whisper"&&c.To=="pfar"),"sender sees their own whisper");
+Check(!(await P("pleader","snapshot")).Chat.Any(c=>c.Scope=="whisper"),"whispers stay private");
+Check((await P("pfar","snapshot")).Chat.All(c=>c.Scope!="whisper"),"each private message is delivered once");
+partyTime+=2;Check((await P("pmember","chat","ghost","hi",scope:"whisper")).Code=="no_such_player","whisper to an unknown name fails");
+await P("pleader","party_invite","pfour");await P("pfour","party_accept","pleader");
+Check((await P("pleader","party_invite","pfive")).Code=="party_full","parties hold four players");
+Check((await P("pmember","party_kick","pfour")).Code=="not_leader","only the leader kicks");
+await P("pleader","party_kick","pfour");
+Check((await P("pfour","snapshot")).Party==null,"kicked player leaves the party");
+await P("pleader","party_leave");
+var newLead=await P("pmember","snapshot");
+Check(newLead.Party.Members.Count==2&&newLead.Party.Members.Single(m=>m.Leader).Name=="pmember","leadership passes on when the leader leaves");
+await partyWorld.Disconnect(ps["pfar"]);
+Check((await P("pmember","snapshot")).Party==null,"a party of one disbands");
+foreach(var who in new[]{"pleader","pmember","poutsider","pfour","pfive"})await partyWorld.Disconnect(ps[who]);
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore
@@ -688,6 +808,8 @@ sealed class FaultStore(IStore inner) : IStore
     public Task<bool> CharacterNameExists(string name) => inner.CharacterNameExists(name);
     public Task Save(Account account, long? expectedRevision) => Fail
         ? Task.FromException(new IOException("Injected storage failure")) : inner.Save(account, expectedRevision);
+    public Task SaveMany(IReadOnlyList<(Account Account, long? ExpectedRevision)> changes) => Fail
+        ? Task.FromException(new IOException("Injected storage failure")) : inner.SaveMany(changes);
 }
 
 sealed class DelayedStore(IStore inner):IStore {
@@ -697,4 +819,5 @@ sealed class DelayedStore(IStore inner):IStore {
     public Task<Account?> Load(string name)=>inner.Load(name);
     public Task<bool> CharacterNameExists(string name)=>inner.CharacterNameExists(name);
     public async Task Save(Account account,long? revision) {if(Block&&account.Name=="slowuser"){Entered.TrySetResult();await Release.Task;}await inner.Save(account,revision);}
+    public Task SaveMany(IReadOnlyList<(Account Account,long? ExpectedRevision)> changes)=>inner.SaveMany(changes);
 }
