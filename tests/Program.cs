@@ -192,6 +192,55 @@ if (!string.IsNullOrEmpty(db))
     catch(Npgsql.PostgresException e) when(e.SqlState=="23505"){duplicateName=true;}
     var unchanged=await postgres.Load(pgOther.Name);
     Check(duplicateName&&unchanged!.Revision==0&&unchanged.Characters!.Length==0,"PostgreSQL unique-name failure rolls back account payload and revision");
+
+    // Relational layout: bag slots, worn items and skills come back from their own tables.
+    var hero=made.Account.Characters![0];
+    var gear=InventoryRules.Add(InventoryData.Empty(),[new ItemStack("potion_red",7),new ItemStack("twig_sword",1)]).Inventory!;
+    gear=InventoryRules.Equip(gear,1,1).Inventory;
+    var geared=regionSaved with {Revision=regionSaved.Revision+1,Characters=[hero with {Inventory=gear,Skills=new SkillData(new(){{"pebble_strike",2},{"sprout_heal",1}},3),Progress=new CharacterProgress(4,250,300,50)}]};
+    await postgres.Save(geared,regionSaved.Revision);
+    var back=(await postgres.Load(pgOwner.Name))!.Characters![0];
+    Check(back.Inventory!.Slots[0]==new ItemStack("potion_red",7)&&back.Inventory.Slots.Count(s=>s is not null)==1,"PostgreSQL bag slots round-trip as rows");
+    Check(back.Inventory.Equipped.SequenceEqual(gear.Equipped),"PostgreSQL equipment round-trips as rows");
+    Check(back.Skills!.Points==3&&back.Skills.Levels["pebble_strike"]==2&&back.Skills.Levels.Count==2,"PostgreSQL skills round-trip as rows");
+    Check(back.Progress==new CharacterProgress(4,250,300,50),"PostgreSQL level and experience columns");
+    async Task<long> Count(string sql){await using var c=new Npgsql.NpgsqlConnection(db);await c.OpenAsync();await using var q=new Npgsql.NpgsqlCommand(sql,c);q.Parameters.AddWithValue(pgOwner.Name);return (long)(await q.ExecuteScalarAsync())!;}
+    Check(await Count("SELECT count(*) FROM inventory_items WHERE account_key=$1")==1&&await Count("SELECT count(*) FROM equipment WHERE account_key=$1")==1,"PostgreSQL stores one row per occupied slot");
+    var emptied=geared with {Revision=geared.Revision+1,Characters=[back with {Inventory=InventoryData.Empty()}]};
+    await postgres.Save(emptied,geared.Revision);
+    Check(await Count("SELECT count(*) FROM inventory_items WHERE account_key=$1")==0,"PostgreSQL removes rows of items that left the bag");
+
+    // Trade: two accounts in one transaction. A stale second account rolls back the first.
+    var giver=(await postgres.Load(pgOwner.Name))!;var taker=(await postgres.Load(pgOther.Name))!;
+    bool tradeConflict=false;
+    try {await postgres.SaveMany([(giver with {Revision=giver.Revision+1,Characters=[giver.Characters![0] with {Gold=0}]},giver.Revision),(taker with {Revision=taker.Revision+1},taker.Revision-1)]);}
+    catch(InvalidOperationException){tradeConflict=true;}
+    Check(tradeConflict&&(await postgres.Load(pgOwner.Name))!.Revision==giver.Revision,"PostgreSQL trade conflict leaves both accounts unchanged");
+
+    // Pre-lobby accounts keep their play state on the account (legacy row) and no roster.
+    var pgVeteran=Account.Create("pv_"+Guid.NewGuid().ToString("N")[..10],"test-pass-123") with {Characters=null,Gold=40,X=1.5f,RegionId="coast",Progress=new CharacterProgress(2,20,280,61)};
+    await postgres.Save(pgVeteran,null);
+    var pgVeteranBack=(await postgres.Load(pgVeteran.Name))!;
+    Check(pgVeteranBack.Characters is null&&pgVeteranBack.Gold==40&&pgVeteranBack.X==1.5f&&pgVeteranBack.RegionId=="coast"&&pgVeteranBack.Progress==pgVeteran.Progress,"PostgreSQL legacy account state round-trip");
+    Check(await postgres.CharacterNameExists(CharacterCatalog.NameKey(pgVeteran.Name)),"PostgreSQL legacy account name stays reserved");
+    Check((await postgres.Load(pgVeteran.Name.ToUpperInvariant()))?.Gold==40,"PostgreSQL account lookup ignores letter case");
+
+    // Accounts saved by the old one-document layout are copied into the tables on startup.
+    var oldName="po_"+Guid.NewGuid().ToString("N")[..10];
+    var oldAccount=Account.Create(oldName,"test-pass-123") with {Revision=5,Characters=[hero with {Id=Guid.NewGuid().ToString("N"),Name="O"+Guid.NewGuid().ToString("N")[..10],Gold=77,Inventory=gear}]};
+    await using(var c=new Npgsql.NpgsqlConnection(db)) {
+        await c.OpenAsync();
+        await using(var create=new Npgsql.NpgsqlCommand("CREATE TABLE IF NOT EXISTS planet_accounts(name text PRIMARY KEY, revision bigint NOT NULL, payload jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())",c))await create.ExecuteNonQueryAsync();
+        await using var q=new Npgsql.NpgsqlCommand("INSERT INTO planet_accounts(name,revision,payload) VALUES($1,5,$2::jsonb)",c);
+        q.Parameters.AddWithValue(oldName);q.Parameters.AddWithValue(System.Text.Json.JsonSerializer.Serialize(oldAccount));await q.ExecuteNonQueryAsync();
+    }
+    await using(var restarted=new PostgresStore(db)) {
+        await restarted.Initialize();
+        var migrated=await restarted.Load(oldName);
+        Check(migrated?.Revision==5&&migrated.Characters![0].Gold==77&&migrated.Characters[0].Inventory!.Equipped.Count==1&&migrated.Verify("test-pass-123"),"PostgreSQL migrates old jsonb accounts into tables");
+        await restarted.Initialize();
+        Check((await restarted.Load(oldName))?.Revision==5,"PostgreSQL migration is safe to run twice");
+    }
 }
 else Console.WriteLine("SKIP: PostgreSQL integration (PLANET_TEST_DB not set)");
 // Movement policy and actual world regression checks for the shared meadow map.
