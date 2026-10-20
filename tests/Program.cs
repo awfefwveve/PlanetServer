@@ -848,6 +848,13 @@ Check(newLead.Party.Members.Count==2&&newLead.Party.Members.Single(m=>m.Leader).
 await partyWorld.Disconnect(ps["pfar"]);
 Check((await P("pmember","snapshot")).Party==null,"a party of one disbands");
 foreach(var who in new[]{"pleader","pmember","poutsider","pfour","pfive"})await partyWorld.Disconnect(ps[who]);
+var acceptCalls = 0;
+var accepted = await GameHost.AcceptNext(_ => ++acceptCalls < 3
+    ? ValueTask.FromException<string>(new SocketException((int)SocketError.TooManyOpenSockets)) : ValueTask.FromResult("client"), CancellationToken.None);
+Check(accepted == "client" && acceptCalls == 3, "failed accept is retried instead of stopping the server");
+using (var acceptStop = new CancellationTokenSource(TimeSpan.FromMilliseconds(350)))
+    Check(await GameHost.AcceptNext(_ => ValueTask.FromException<string>(new SocketException((int)SocketError.TooManyOpenSockets)), acceptStop.Token) == null,
+        "accept retry ends on shutdown");
 Console.WriteLine($"RESULT: {passed} assertions passed. Temporary test data: {dir}");
 
 sealed class FaultStore(IStore inner) : IStore

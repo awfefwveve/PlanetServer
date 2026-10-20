@@ -30,14 +30,33 @@ public sealed class GameHost(World world, X509Certificate2 certificate, int port
         var ticking = world.RunTicker(TickInterval, shutdown.Token);
         while (!shutdown.IsCancellationRequested)
         {
-            TcpClient client;
-            try { client = await listener.AcceptTcpClientAsync(shutdown.Token); }
-            catch (OperationCanceledException) { break; }
+            var client = await AcceptNext(listener.AcceptTcpClientAsync, shutdown.Token);
+            if (client == null) break;
             if (!await slots.WaitAsync(0)) { client.Dispose(); continue; }
             clients.RemoveAll(t => t.IsCompleted);
             clients.Add(Serve(client));
         }
         await ticking;
+    }
+    // Wait before retrying a failed accept so a persistent error does not spin the CPU.
+    public static readonly TimeSpan AcceptRetryDelay = TimeSpan.FromMilliseconds(100);
+    // Returns null only on shutdown. A failed accept (for example running out of file handles
+    // during a connection burst) affects that one connection, so it is logged and retried
+    // instead of ending Run(), which would stop the server and drop every player in game.
+    public static async Task<T?> AcceptNext<T>(Func<CancellationToken, ValueTask<T>> accept, CancellationToken ct) where T : class
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try { return await accept(ct); }
+            catch (OperationCanceledException) { return null; }
+            catch (SocketException ex)
+            {
+                Log("accept_failed", null, ex.SocketErrorCode.ToString());
+                try { await Task.Delay(AcceptRetryDelay, ct); }
+                catch (OperationCanceledException) { return null; }
+            }
+        }
+        return null;
     }
     // One connection = one reader loop (this method) + one writer loop.
     // Only the writer touches SslStream.Write, so replies and tick pushes never interleave bytes.

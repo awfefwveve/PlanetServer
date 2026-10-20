@@ -6,7 +6,7 @@
 
 - **스택:** C# / .NET 10 · TCP + TLS 지속 연결 · Protobuf · PostgreSQL · Unity 6 클라이언트
 - **구현:** 로그인·캐릭터 생성 · 채널 30개(정원·자동 배정) · 지역 포탈 · 100ms 서버 틱 + 상태 푸시 · 몬스터 AI(비선공→추적→귀환) · HP/MP·사망·부활·경험치 · 가방 24칸·장비 4부위 · 스킬 3종 · NPC 상점 · 플레이어 거래 · 파티(경험치 분배) · 채팅(방/파티/귓말)
-- **테스트:** 기능·장애 테스트 312개 (PostgreSQL 포함) · 부하 측정 50~1,000 클라이언트 (`load-results/`)
+- **테스트:** 기능·장애 테스트 314개 (PostgreSQL 포함) · 부하 측정 50~1,000 클라이언트 (`load-results/`)
 
 ## 핵심 설계 5가지
 
@@ -24,21 +24,21 @@ AI 코딩 도구(Codex, Claude)로 구현 속도를 내고, 결과물은 제가 
 |---|---|---|---|
 | DB가 계정을 JSON 한 덩어리로 저장 → 테이블·인덱스 설계가 없음 | 파일 저장을 그대로 DB 한 칸에 옮긴 지름길 | 테이블 5개, 기본키·외래키·CHECK·UNIQUE, 아이템 인덱스, 옛 데이터 자동 이관 | PostgreSQL 테스트 20개 추가 |
 | 리눅스에서 대소문자가 다른 계정을 못 찾음 | 로그인은 소문자로 찾는데 파일 저장은 원래 이름으로 저장. 윈도우는 대소문자를 무시해서 안 보였음 | 두 저장소 모두 소문자 키로 통일 | 기존 실패 테스트 통과 |
-| (B가 채울 것) | | | |
+| 접속 받기에서 오류가 한 번만 나도 서버 전체가 꺼지고 게임 중인 플레이어가 모두 끊김 | 접속 받기(`AcceptTcpClientAsync`) 예외를 아무도 안 잡아서 `Run()`이 끝나고, `Program.cs`가 이를 서버 종료로 처리 | `AcceptNext`에서 `SocketException`만 잡아 로그를 남기고 100ms 뒤 다시 받음. 종료 요청일 때만 멈춤 | 실패 재시도·종료 테스트 2개 추가 |
 
 ## 테스트와 한계
 
-- 통과: 기능·장애 테스트 312개. 저장 실패, 오래된 revision, 동시 보상 요청, 만원 채널, 거래 충돌 같은 실패 경우를 직접 재현합니다(`FaultStore`, `DelayedStore`).
+- 통과: 기능·장애 테스트 314개. 저장 실패, 오래된 revision, 동시 보상 요청, 만원 채널, 거래 충돌 같은 실패 경우를 직접 재현합니다(`FaultStore`, `DelayedStore`).
 - 부하: 같은 PC에서 서버와 부하 생성기를 따로 띄워 측정했습니다. 1,000 클라이언트 요청 중 691개가 끝까지 활동했고 나머지는 접속 단계에서 끊겼습니다. 상용 수용량 수치가 아니며 원인 분석이 다음 작업입니다.
 - 아직 없음: 시야 범위(AOI) 필터링, 재접속 복구, 배포·모니터링.
 
 ## 실행
 
 ```sh
-# 테스트 (PostgreSQL 없이 292개)
+# 테스트 (PostgreSQL 없이 294개)
 dotnet run --project tests
 
-# PostgreSQL 포함 312개
+# PostgreSQL 포함 314개
 docker compose up -d
 PLANET_TEST_DB="Host=127.0.0.1;Port=55432;Username=planet;Password=planet-local-dev-only;Database=planet" dotnet run --project tests
 
