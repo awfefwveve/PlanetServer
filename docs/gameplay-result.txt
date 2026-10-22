@@ -1,1 +1,0 @@
-name=smoke_063227 kills=5 shards=5 gold=100 claimed=True
